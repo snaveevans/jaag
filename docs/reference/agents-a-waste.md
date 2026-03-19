@@ -1,0 +1,5 @@
+Okay, so I bought a whiteboard because no one was understanding why agents are a waste of time. I don't mean using agents, I mean building them. So in order to make AI not stupid, you need to route it to the right place. To be able to give it the right instructions, give it the right tools, and give it the right data. Currently, people have built frameworks to do that. Langechain, the Anthropic Agent SDK, Semantic Kernel. All of those are different ways to route.
+These problems. People spend this time building with Python or C Sharp, all these crazy agent frameworks, only to get replaced by a model update from one of the big guys. This isn't because AI is moving too fast. It's actually because of something else. People building agents are often operating at the wrong abstraction layer. Or more importantly, they're missing the most basic thing in computer science. File trees.
+File trees.
+All of that without you having to code in Python or C# like semantic kernel requires.
+Condense your workflow into a feature update. Guess what? It's now a subtask or a tool. You are operating on the wrong abstraction layer if you think AI is moving too fast.
