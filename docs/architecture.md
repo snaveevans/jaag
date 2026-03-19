@@ -2054,11 +2054,11 @@ The LLM interface is how the runtime talks to the model. It must be model-agnost
 
 The runtime works in its own internal message format. A thin provider adapter translates between the runtime's format and the provider's API format. Each adapter has three responsibilities:
 
-1. **Message translation.** Convert the session's message history into the provider's expected format. Anthropic uses a `messages` array with `user`/`assistant`/`tool` roles. OpenAI uses a similar but not identical structure. Local model APIs may use prompt templates. The adapter handles these differences.
+1. **Message translation.** Convert the session's message history into the provider's expected format. OpenAI uses a `messages` array with `system`/`user`/`assistant`/`tool` roles — this is the format the initial adapter targets. Anthropic uses a similar but not identical structure. Local model APIs may use prompt templates. The adapter handles these differences.
 
-2. **Tool declaration.** Present callable functions in whatever schema the provider expects. Anthropic, OpenAI, and Google all support JSON Schema-based function declarations but with slightly different wrapper formats. The adapter translates the runtime's canonical function list into the provider-specific declaration format, including adjusting function name characters (e.g., dots in `gmail.messages.send` may become underscores for providers that restrict function name characters to `a-zA-Z0-9_-`).
+2. **Tool declaration.** Present callable functions in whatever schema the provider expects. OpenAI, Anthropic, and Google all support JSON Schema-based function declarations but with slightly different wrapper formats. The adapter translates the runtime's canonical function list into the provider-specific declaration format, including adjusting function name characters (e.g., dots in `gmail.messages.send` may become underscores for providers that restrict function name characters to `a-zA-Z0-9_-`).
 
-3. **Response parsing.** Extract the model's text output and/or tool call requests from the provider's response format. Each provider returns tool calls differently — Anthropic uses `tool_use` content blocks, OpenAI uses `tool_calls` on the assistant message, etc. The adapter normalizes these into a uniform internal structure.
+3. **Response parsing.** Extract the model's text output and/or tool call requests from the provider's response format. Each provider returns tool calls differently — OpenAI uses `tool_calls` on the assistant message, Anthropic uses `tool_use` content blocks, etc. The adapter normalizes these into a uniform internal structure.
 
 ```typescript
 interface LLMProvider {
@@ -2202,13 +2202,16 @@ The provider, model, and parameters are set in `config.yaml`:
 
 ```yaml
 llm:
-  provider: anthropic          # or: openai, google, local
-  model: claude-sonnet-4-20250514    # provider-specific model ID
-  context_limit: 200000        # tokens — must match the model's actual limit
-  max_output_tokens: 8192      # per-turn output limit
-  temperature: 0               # 0 for deterministic tool use, adjust for creative tasks
-  api_key_env: ANTHROPIC_API_KEY   # environment variable name (not the key itself)
+  provider: openai               # OpenAI-compatible (OpenAI, Minimax, Together, Groq, etc.)
+  model: gpt-4o                  # provider-specific model ID
+  base_url: https://api.openai.com/v1  # optional — defaults to OpenAI, set for other providers
+  context_limit: 128000          # tokens — must match the model's actual limit
+  max_output_tokens: 8192        # per-turn output limit
+  temperature: 0                 # 0 for deterministic tool use, adjust for creative tasks
+  api_key_env: OPENAI_API_KEY    # environment variable name (not the key itself)
 ```
+
+The `base_url` field enables any OpenAI-compatible provider. For example, Minimax would use `base_url: https://api.minimax.chat/v1` with `api_key_env: MINIMAX_API_KEY`. The adapter code is identical — only the config changes.
 
 The `api_key_env` field stores the name of the environment variable containing the API key, not the key itself. The config file can be safely committed or backed up without exposing credentials. The runtime reads the actual key from the environment at startup.
 

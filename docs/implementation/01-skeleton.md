@@ -16,7 +16,7 @@ A Bun TypeScript daemon that:
 3. Accepts a client connection
 4. Receives a text message from the user
 5. Creates a session with a system prompt
-6. Streams the message to an LLM provider (Anthropic Claude to start)
+6. Streams the message to an LLM provider (OpenAI-compatible — works with OpenAI, Minimax, and any provider that implements the OpenAI chat completions API)
 7. Streams the response back to the user over WebSocket
 8. Handles the basic ReAct loop: if the model requests a tool call, the runtime acknowledges it (stub — no actual primitive execution yet)
 
@@ -42,7 +42,7 @@ This is NOT a useful agent yet. It is the skeleton that every subsequent slice b
     llm/
       types.ts            # provider-agnostic types (InternalMessage, StreamChunk, ToolDeclaration)
       provider.ts         # LLMProvider interface
-      anthropic.ts        # Anthropic adapter implementation
+      openai.ts           # OpenAI-compatible adapter implementation (covers OpenAI, Minimax, etc.)
     communication/
       adapter.ts          # CommunicationAdapter interface
       websocket.ts        # WebSocket adapter implementation
@@ -57,8 +57,9 @@ This is NOT a useful agent yet. It is the skeleton that every subsequent slice b
   ```typescript
   interface AgentConfig {
     llm: {
-      provider: 'anthropic' // only one for now
+      provider: 'openai'  // OpenAI-compatible (OpenAI, Minimax, Together, Groq, etc.)
       model: string
+      base_url?: string   // defaults to https://api.openai.com/v1 — set for other providers
       context_limit: number
       max_output_tokens: number
       temperature: number
@@ -91,7 +92,7 @@ This is NOT a useful agent yet. It is the skeleton that every subsequent slice b
   - Inbound: `{ type: "message", content: string }`
   - Outbound: `{ type: "message", content: string, actions?: Action[] }` and `{ type: "stream_chunk", content: string }` for streaming text
 
-### Task 1.4: Anthropic LLM Provider Adapter
+### Task 1.4: OpenAI-Compatible LLM Provider Adapter
 - Implement the LLMProvider interface:
   ```typescript
   interface LLMProvider {
@@ -102,12 +103,16 @@ This is NOT a useful agent yet. It is the skeleton that every subsequent slice b
     ): AsyncIterable<StreamChunk>
   }
   ```
-- Use Anthropic's Messages API with streaming (`stream: true`)
-- Translate InternalMessage array to Anthropic's message format
-- Translate ToolDeclaration array to Anthropic's tool schema format
-- Parse streaming SSE events into StreamChunk objects
+- Install the `openai` npm package (`bun add openai`). The OpenAI SDK is a thin, well-typed client that handles SSE parsing and is the de facto standard for OpenAI-compatible providers. It is not a framework — it is a transport layer.
+- Initialize the OpenAI client with `baseURL` from config (defaults to `https://api.openai.com/v1`) and `apiKey` from the resolved environment variable. This single client works for OpenAI, Minimax, Together, Groq, and any provider that implements the OpenAI chat completions API.
+- Translate InternalMessage array to OpenAI's chat completion message format (`system`, `user`, `assistant`, `tool` roles)
+- Translate ToolDeclaration array to OpenAI's tool/function schema format
+- Use the SDK's streaming interface (`stream: true` on `chat.completions.create`) to get an async iterable of chunks
+- Parse streaming chunks into StreamChunk objects:
+  - `choices[0].delta.content` → text chunks
+  - `choices[0].delta.tool_calls` → tool call chunks (accumulated by index)
+  - `choices[0].finish_reason === 'tool_calls'` → signals tool calls are complete
 - Handle API errors (auth failure, rate limiting, server errors) with clear error messages
-- Use `fetch()` directly — no SDK dependency. Keep it minimal.
 
 ### Task 1.5: Session Model
 - Implement session creation and lifecycle:
@@ -160,7 +165,7 @@ All of the following must work:
 
 1. `bun run src/index.ts` starts the daemon, prints startup info, writes PID file
 2. A WebSocket client can connect to the configured port
-3. Sending a text message results in a streamed response from Claude appearing on the client
+3. Sending a text message results in a streamed response from the configured model appearing on the client
 4. If the model tries to call a tool (e.g., if the system prompt mentions available tools), the runtime correctly detects the tool call, returns a stub error, and the model receives it and responds accordingly
 5. Sending SIGINT gracefully shuts down the daemon and removes the PID file
 6. Running the daemon twice (without stopping the first) fails with a "already running" error
@@ -178,7 +183,7 @@ All of the following must work:
 ### Automated Tests
 - **Config loader:** Unit tests for parsing valid config, handling missing fields, reading env vars
 - **Session model:** Unit tests for message appending, iteration counting, timeout detection
-- **Anthropic adapter:** Unit test with a mock HTTP server that returns streaming SSE chunks — verify StreamChunk parsing
+- **OpenAI adapter:** Unit test with a mock HTTP server that returns OpenAI-format streaming SSE chunks — verify StreamChunk parsing
 - **Core loop:** Integration test with a mock LLM provider — verify the full ReAct cycle (message → LLM → tool call stub → LLM → final response)
 - **WebSocket adapter:** Integration test — start server, connect client, send/receive messages
 
