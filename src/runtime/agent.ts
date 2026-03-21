@@ -1,10 +1,18 @@
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
 import type { LLMProvider } from "../llm/provider.ts";
 import type { ModelConfig, ToolCall } from "../llm/types.ts";
-import { RAW_PRIMITIVE_DECLARATIONS } from "../primitives/types.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
+import type { PrimitiveContext } from "../primitives/types.ts";
 import { SessionManager } from "../session/manager.ts";
 import type { AgentSession } from "../session/session.ts";
+
+const AUTHORIZATION_CODE_TIMEOUT_MS = 5 * 60 * 1000;
+
+interface PendingAuthorizationCodeRequest {
+  resolve: (authorizationCode: string) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
 
 interface StreamCapableAdapter extends CommunicationAdapter {
   sendStreamChunk(sessionId: string, content: string): Promise<DeliveryResult>;
@@ -25,6 +33,7 @@ export class AgentRuntime {
   private readonly sessionManager: SessionManager;
   private readonly primitiveDispatcher: PrimitiveDispatcher;
   private readonly inboundQueue: InboundMessage[] = [];
+  private pendingAuthorizationCodeRequest: PendingAuthorizationCodeRequest | null = null;
   private drainPromise: Promise<void> | null = null;
   private started = false;
   private shuttingDown = false;
@@ -35,6 +44,9 @@ export class AgentRuntime {
     this.modelConfig = options.modelConfig;
     this.sessionManager = options.sessionManager;
     this.primitiveDispatcher = options.primitiveDispatcher;
+    this.primitiveDispatcher.setAuthorizationCodeHandler(async (message, context) => {
+      return await this.requestAuthorizationCode(message, context);
+    });
   }
 
   start(): void {
@@ -48,6 +60,11 @@ export class AgentRuntime {
         return;
       }
 
+      if (this.pendingAuthorizationCodeRequest) {
+        this.resolvePendingAuthorizationCodeRequest(message.content);
+        return;
+      }
+
       this.inboundQueue.push(message);
       this.ensureDrainLoop();
     });
@@ -55,6 +72,7 @@ export class AgentRuntime {
 
   async shutdown(timeoutMs = 30_000): Promise<boolean> {
     this.shuttingDown = true;
+    this.rejectPendingAuthorizationCodeRequest("Runtime is shutting down.");
     return this.waitForIdle(timeoutMs);
   }
 
@@ -120,10 +138,11 @@ export class AgentRuntime {
       const assistantTextParts: string[] = [];
       const toolCallsById = new Map<string, ToolCall>();
       const toolCallOrder: string[] = [];
+      const toolDeclarations = this.primitiveDispatcher.getToolDeclarations();
 
       for await (const chunk of this.llmProvider.stream(
         session.messages,
-        RAW_PRIMITIVE_DECLARATIONS,
+        toolDeclarations,
         this.modelConfig,
       )) {
         if (chunk.type === "text" && chunk.content) {
@@ -231,6 +250,70 @@ export class AgentRuntime {
       format: "plain",
     };
     await this.adapter.send(message);
+  }
+
+  private async requestAuthorizationCode(message: string, context: PrimitiveContext): Promise<string> {
+    if (this.shuttingDown) {
+      throw new Error("Runtime is shutting down.");
+    }
+
+    const session = this.sessionManager.getSession(context.sessionId);
+    if (!session || session.isTerminal()) {
+      throw new Error(`Cannot request an OAuth authorization code for inactive session ${context.sessionId}.`);
+    }
+
+    if (this.pendingAuthorizationCodeRequest) {
+      throw new Error("Another OAuth authorization request is already waiting for a user response.");
+    }
+
+    await this.adapter.send({
+      sessionId: context.sessionId,
+      mode: "ask",
+      content: message,
+      format: "plain",
+    });
+
+    return await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingAuthorizationCodeRequest = null;
+        reject(new Error("Timed out waiting for an OAuth authorization code from the user."));
+      }, AUTHORIZATION_CODE_TIMEOUT_MS);
+
+      this.pendingAuthorizationCodeRequest = {
+        resolve,
+        reject,
+        timer,
+      };
+    });
+  }
+
+  private resolvePendingAuthorizationCodeRequest(content: string): void {
+    const request = this.pendingAuthorizationCodeRequest;
+    if (!request) {
+      return;
+    }
+
+    this.pendingAuthorizationCodeRequest = null;
+    clearTimeout(request.timer);
+
+    const authorizationCode = content.trim();
+    if (authorizationCode === "") {
+      request.reject(new Error("Received an empty OAuth authorization code from the user."));
+      return;
+    }
+
+    request.resolve(authorizationCode);
+  }
+
+  private rejectPendingAuthorizationCodeRequest(message: string): void {
+    const request = this.pendingAuthorizationCodeRequest;
+    if (!request) {
+      return;
+    }
+
+    this.pendingAuthorizationCodeRequest = null;
+    clearTimeout(request.timer);
+    request.reject(new Error(message));
   }
 }
 

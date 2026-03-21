@@ -17,6 +17,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
       apiKey: config.apiKey,
       baseURL: config.baseUrl,
     });
+    const toolNameMap = buildToolNameMap(tools);
 
     const toolCallState = new Map<number, ToolCallState>();
     let emittedToolCallEnd = false;
@@ -24,7 +25,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
     try {
       const response = await client.chat.completions.create({
         model: config.model,
-        messages: toOpenAIMessages(messages) as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+        messages: toOpenAIMessages(messages, toolNameMap) as unknown as OpenAI.Chat.Completions.ChatCompletionMessageParam[],
         tools: toOpenAITools(tools) as unknown as OpenAI.Chat.Completions.ChatCompletionTool[],
         temperature: config.temperature,
         max_tokens: config.maxOutputTokens,
@@ -72,14 +73,14 @@ export class OpenAICompatibleProvider implements LLMProvider {
             yield {
               type: "tool_call_start",
               toolCallKey: current.key,
-              toolCall: decodeToolCall(current.toolCall),
+              toolCall: decodeToolCall(current.toolCall, toolNameMap),
             };
           }
 
           yield {
             type: "tool_call_delta",
             toolCallKey: current.key,
-            toolCall: decodeToolCall(current.toolCall),
+            toolCall: decodeToolCall(current.toolCall, toolNameMap),
           };
         }
 
@@ -89,7 +90,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
             yield {
               type: "tool_call_end",
               toolCallKey: toolCall.key,
-              toolCall: decodeToolCall(toolCall.toolCall),
+              toolCall: decodeToolCall(toolCall.toolCall, toolNameMap),
             };
           }
         }
@@ -100,7 +101,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
           yield {
             type: "tool_call_end",
             toolCallKey: toolCall.key,
-            toolCall: decodeToolCall(toolCall.toolCall),
+            toolCall: decodeToolCall(toolCall.toolCall, toolNameMap),
           };
         }
       }
@@ -118,7 +119,12 @@ export class OpenAICompatibleProvider implements LLMProvider {
   }
 }
 
-function toOpenAIMessages(messages: InternalMessage[]): Array<Record<string, unknown>> {
+interface ToolNameMap {
+  canonicalToProvider: Map<string, string>;
+  providerToCanonical: Map<string, string>;
+}
+
+function toOpenAIMessages(messages: InternalMessage[], toolNameMap: ToolNameMap): Array<Record<string, unknown>> {
   return messages.map((message) => {
     if (message.role === "tool_result") {
       return {
@@ -136,7 +142,7 @@ function toOpenAIMessages(messages: InternalMessage[]): Array<Record<string, unk
           id: toolCall.id,
           type: "function",
           function: {
-            name: encodeToolName(toolCall.name),
+            name: resolveProviderToolName(toolCall.name, toolNameMap),
             arguments: toolCall.arguments,
           },
         })),
@@ -154,19 +160,39 @@ function toOpenAITools(tools: ToolDeclaration[]): Array<Record<string, unknown>>
   return tools.map((tool) => ({
     type: "function",
     function: {
-      name: encodeToolName(tool.name),
+      name: tool.providerName ?? encodeToolName(tool.name),
       description: tool.description,
       parameters: tool.parameters,
     },
   }));
 }
 
-function decodeToolCall(toolCall: ToolCall): ToolCall {
+function decodeToolCall(toolCall: ToolCall, toolNameMap: ToolNameMap): ToolCall {
   return {
     id: toolCall.id,
-    name: decodeToolName(toolCall.name),
+    name: toolNameMap.providerToCanonical.get(toolCall.name) ?? decodeToolName(toolCall.name),
     arguments: toolCall.arguments,
   };
+}
+
+function buildToolNameMap(tools: ToolDeclaration[]): ToolNameMap {
+  const canonicalToProvider = new Map<string, string>();
+  const providerToCanonical = new Map<string, string>();
+
+  for (const tool of tools) {
+    const providerName = tool.providerName ?? encodeToolName(tool.name);
+    canonicalToProvider.set(tool.name, providerName);
+    providerToCanonical.set(providerName, tool.name);
+  }
+
+  return {
+    canonicalToProvider,
+    providerToCanonical,
+  };
+}
+
+function resolveProviderToolName(name: string, toolNameMap: ToolNameMap): string {
+  return toolNameMap.canonicalToProvider.get(name) ?? encodeToolName(name);
 }
 
 export function encodeToolName(name: string): string {

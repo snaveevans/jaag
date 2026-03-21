@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDatabaseMigrations } from "../db/migrations.ts";
+import { buildMockBearerToolSpec } from "../test/tool-spec-fixtures.ts";
 import { PrimitiveDispatcher } from "./dispatcher.ts";
 
 const databases: Database[] = [];
@@ -110,5 +111,88 @@ describe("PrimitiveDispatcher", () => {
         ],
       },
     });
+  });
+
+  test("routes raw http, system tools, and spec-backed operations", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-dispatcher-http-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const server = Bun.serve({
+      port: 0,
+      fetch: (request) => {
+        const url = new URL(request.url);
+        if (url.pathname === "/raw") {
+          return Response.json({ ok: true });
+        }
+
+        if (url.pathname === "/items/octocat") {
+          expect(request.headers.get("Authorization")).toBe("Bearer test-token");
+          return Response.json([{ id: 1, name: "alpha", ignored: true }]);
+        }
+
+        return new Response("missing", { status: 404 });
+      },
+    });
+
+    try {
+      const dispatcher = new PrimitiveDispatcher({
+        agentHome,
+        workspaceDir,
+        env: {
+          MOCK_API_TOKEN: "test-token",
+        },
+      });
+
+      const registerResult = await dispatcher.dispatch(
+        "spec.register",
+        {
+          spec: buildMockBearerToolSpec(`http://127.0.0.1:${server.port}`),
+        },
+        { sessionId: "session-1" },
+      );
+      expect(registerResult.success).toBe(true);
+
+      const declarations = dispatcher.getToolDeclarations();
+      expect(declarations).toContainEqual(expect.objectContaining({
+        name: "mockapi.items.list",
+        providerName: "mockapi_items_list",
+      }));
+
+      const rawHttpResult = await dispatcher.dispatch(
+        "http",
+        {
+          url: `http://127.0.0.1:${server.port}/raw`,
+          method: "GET",
+        },
+        { sessionId: "session-1" },
+      );
+      expect(rawHttpResult).toMatchObject({
+        success: true,
+        data: {
+          body: { ok: true },
+        },
+      });
+
+      const toolResult = await dispatcher.dispatch(
+        "mockapi.items.list",
+        {
+          owner: "octocat",
+        },
+        { sessionId: "session-1" },
+      );
+      expect(toolResult).toMatchObject({
+        success: true,
+        data: {
+          response: [{ id: 1, name: "alpha" }],
+        },
+      });
+    } finally {
+      server.stop(true);
+    }
   });
 });

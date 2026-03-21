@@ -13,6 +13,7 @@ export interface InternalMessage {
 
 export interface ToolDeclaration {
   name: string;
+  providerName?: string;
   description: string;
   parameters: Record<string, unknown>;
 }

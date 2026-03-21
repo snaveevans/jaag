@@ -37,6 +37,10 @@ async function main(): Promise<void> {
   try {
     const config = await loadConfig();
     getDatabase({ agentHome: config.agentHome });
+    const primitiveDispatcher = new PrimitiveDispatcher({
+      agentHome: config.agentHome,
+      workspaceDir: process.cwd(),
+    });
     adapter = new WebSocketCommunicationAdapter({
       port: config.communication.port,
     });
@@ -47,12 +51,12 @@ async function main(): Promise<void> {
       llmProvider: new OpenAICompatibleProvider(),
       modelConfig: config.llm,
       sessionManager: new SessionManager({
-        buildSystemPrompt: buildBaseSystemPrompt,
+        buildSystemPrompt: (now) => buildBaseSystemPrompt({
+          now,
+          toolManifests: primitiveDispatcher.listToolManifests(),
+        }),
       }),
-      primitiveDispatcher: new PrimitiveDispatcher({
-        agentHome: config.agentHome,
-        workspaceDir: process.cwd(),
-      }),
+      primitiveDispatcher,
     });
     runtime.start();
 

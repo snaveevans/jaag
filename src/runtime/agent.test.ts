@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
@@ -6,7 +7,24 @@ import type { LLMProvider } from "../llm/provider.ts";
 import type { InternalMessage, ModelConfig, StreamChunk, ToolDeclaration } from "../llm/types.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
 import { SessionManager } from "../session/manager.ts";
+import { buildMockBearerToolSpec, buildMockOAuthToolSpec } from "../test/tool-spec-fixtures.ts";
 import { AgentRuntime } from "./agent.ts";
+
+const servers: Bun.Server<unknown>[] = [];
+const tempDirs: string[] = [];
+
+afterEach(async () => {
+  while (servers.length > 0) {
+    servers.pop()?.stop(true);
+  }
+
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+});
 
 class FakeAdapter implements CommunicationAdapter {
   sentMessages: OutboundMessage[] = [];
@@ -122,6 +140,51 @@ class SlowTextProvider implements LLMProvider {
     this.userMessages.push(latestUserMessage?.content ?? "");
     await Bun.sleep(25);
     yield { type: "text", content: `reply:${latestUserMessage?.content ?? ""}` };
+    yield { type: "done" };
+  }
+}
+
+class ToolRecordingProvider implements LLMProvider {
+  toolNames: string[] = [];
+
+  async *stream(
+    _messages: InternalMessage[],
+    tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.toolNames = tools.map((tool) => tool.name);
+    yield { type: "text", content: "Recorded tools." };
+    yield { type: "done" };
+  }
+}
+
+class OAuthToolThenTextProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "oauthmock.profile.get", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: { id: "call-1", name: "oauthmock.profile.get", arguments: "{}" },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"success":true');
+
+    yield { type: "text", content: "Authorized fetch complete." };
     yield { type: "done" };
   }
 }
@@ -242,4 +305,185 @@ describe("AgentRuntime", () => {
     ]);
     expect(session?.messages[3]?.toolResultId).toBe("call-1");
   });
+
+  test("passes dispatcher-generated tool declarations to the provider", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new ToolRecordingProvider();
+    const dispatcher = new PrimitiveDispatcher({
+      workspaceDir: join(tmpdir(), `agent-runtime-tools-${crypto.randomUUID()}`),
+      seedTrustedSpecs: false,
+    });
+    await dispatcher.dispatch(
+      "spec.register",
+      {
+        spec: buildMockBearerToolSpec("https://example.test"),
+      },
+      { sessionId: "seed-session" },
+    );
+
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound("hello");
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.toolNames).toContain("spec.list");
+    expect(provider.toolNames).toContain("mockapi.items.list");
+  });
+
+  test("uses the adapter to collect an OAuth authorization code and resumes the active session", async () => {
+    let tokenRequests = 0;
+    let profileRequests = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        const pathname = new URL(request.url).pathname;
+        if (pathname === "/oauth/token") {
+          tokenRequests += 1;
+          const body = await request.formData();
+          expect(body.get("grant_type")).toBe("authorization_code");
+          expect(body.get("code")).toBe("code-123");
+
+          return Response.json({
+            access_token: "fresh-token",
+            refresh_token: "refresh-456",
+            expires_in: 3600,
+            token_type: "Bearer",
+          });
+        }
+
+        if (pathname === "/profile") {
+          profileRequests += 1;
+          expect(request.headers.get("Authorization")).toBe("Bearer fresh-token");
+          return Response.json({ id: "user-1", name: "Taylor", ignored: true });
+        }
+
+        return new Response("missing", { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-oauth-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+      env: {
+        MOCK_CLIENT_ID: "client-id",
+        MOCK_CLIENT_SECRET: "client-secret",
+      },
+      seedTrustedSpecs: false,
+    });
+    const registerResult = await dispatcher.dispatch(
+      "spec.register",
+      {
+        spec: buildMockOAuthToolSpec(`http://127.0.0.1:${server.port}`),
+      },
+      { sessionId: "seed-session" },
+    );
+    expect(registerResult.success).toBe(true);
+
+    const adapter = new FakeAdapter();
+    const provider = new OAuthToolThenTextProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound("fetch my profile");
+
+    await waitForCondition(
+      () => adapter.sentMessages.some((message) => message.mode === "ask"),
+      1000,
+      "Timed out waiting for the OAuth prompt",
+    );
+
+    expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+      mode: "ask",
+      content: expect.stringContaining("Authorization is required for OAuth Mock."),
+    }));
+
+    adapter.dispatchInbound("code-123");
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.callCount).toBe(2);
+    expect(tokenRequests).toBe(1);
+    expect(profileRequests).toBe(1);
+
+    const session = sessionManager.getInteractiveSession();
+    expect(session?.messages.filter((message) => message.role === "user").map((message) => message.content)).toEqual([
+      "fetch my profile",
+    ]);
+    expect(session?.messages[3]?.content).toContain('"success":true');
+    expect(adapter.streamChunks).toEqual([
+      { sessionId: sessionManager.getInteractiveSession()!.id, content: "Authorized fetch complete." },
+    ]);
+
+    const storedToken = await dispatcher.dispatch(
+      "memory",
+      {
+        operation: "get",
+        domain: "oauthmock",
+        key: "oauth:oauthmock:tokens",
+      },
+      { sessionId: "session-check" },
+    );
+    expect(storedToken).toMatchObject({
+      success: true,
+      data: {
+        entry: {
+          value: expect.stringContaining("fresh-token"),
+        },
+      },
+    });
+  });
 });
+
+async function waitForCondition(
+  predicate: () => boolean,
+  timeoutMs: number,
+  errorMessage: string,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(errorMessage);
+    }
+
+    await Bun.sleep(10);
+  }
+}
