@@ -33,11 +33,15 @@ export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
   },
   {
     name: "file_read",
-    description: "Read a file or list a directory path on disk.",
+    description:
+      "Read a UTF-8 file or list a directory. Relative paths resolve against the workspace and files larger than 1MB are truncated with a notice.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Path to read." },
+        path: {
+          type: "string",
+          description: "Path to read. Supports absolute paths, ~/ paths, and workspace-relative paths.",
+        },
       },
       required: ["path"],
       additionalProperties: false,
@@ -45,11 +49,15 @@ export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
   },
   {
     name: "file_write",
-    description: "Write content to a file path on disk.",
+    description:
+      "Write full UTF-8 file contents to disk. Relative paths resolve against the workspace, parent directories are created, and protected runtime paths are blocked.",
     parameters: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Destination path." },
+        path: {
+          type: "string",
+          description: "Destination path. Supports absolute paths, ~/ paths, and workspace-relative paths.",
+        },
         content: { type: "string", description: "Full file content to write." },
       },
       required: ["path", "content"],
@@ -70,18 +78,33 @@ export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
   },
   {
     name: "memory",
-    description: "Read, write, search, list, or delete memory entries.",
+    description:
+      "Use persistent SQLite-backed memory. Supports exact get/set/delete by domain+key plus FTS search and listing across stored memories.",
     parameters: {
       type: "object",
       properties: {
-        operation: { type: "string", description: "Memory operation such as get, set, or search." },
-        key: { type: "string", description: "Optional memory key." },
-        value: { description: "Optional value for writes." },
-        query: { type: "string", description: "Optional search query." },
-        domain: { type: ["string", "null"], description: "Optional memory domain." },
+        operation: {
+          type: "string",
+          enum: ["get", "set", "search", "list", "delete"],
+          description: "Memory operation to perform.",
+        },
+        key: { type: "string", description: "Key used by get, set, and delete." },
+        value: { type: "string", description: "Value used by set." },
+        query: { type: "string", description: "Full-text query used by search." },
+        domain: {
+          type: ["string", "null"],
+          description:
+            "Domain namespace. Use null for general memory. Omit it for search/list to scan all domains.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          description: "Optional max number of entries returned by search or list.",
+        },
       },
       required: ["operation"],
-      additionalProperties: true,
+      additionalProperties: false,
     },
   },
   {

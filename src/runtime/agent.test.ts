@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
 import type { LLMProvider } from "../llm/provider.ts";
 import type { InternalMessage, ModelConfig, StreamChunk, ToolDeclaration } from "../llm/types.ts";
@@ -142,7 +144,9 @@ describe("AgentRuntime", () => {
         apiKey: "test-key",
       },
       sessionManager,
-      primitiveDispatcher: new PrimitiveDispatcher(),
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-missing-${crypto.randomUUID()}`),
+      }),
     });
 
     runtime.start();
@@ -164,7 +168,7 @@ describe("AgentRuntime", () => {
       "assistant",
     ]);
     expect(session?.messages[2]?.toolCalls?.[0]?.name).toBe("file_read");
-    expect(session?.messages[3]?.content).toContain("Primitive not implemented yet");
+    expect(session?.messages[3]?.content).toContain('"success":false');
     expect(session?.status).toBe("waiting_for_user");
   });
 
@@ -185,7 +189,9 @@ describe("AgentRuntime", () => {
         apiKey: "test-key",
       },
       sessionManager,
-      primitiveDispatcher: new PrimitiveDispatcher(),
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-missing-${crypto.randomUUID()}`),
+      }),
     });
 
     runtime.start();
@@ -219,7 +225,9 @@ describe("AgentRuntime", () => {
         apiKey: "test-key",
       },
       sessionManager,
-      primitiveDispatcher: new PrimitiveDispatcher(),
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-missing-${crypto.randomUUID()}`),
+      }),
     });
 
     runtime.start();

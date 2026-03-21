@@ -6,6 +6,7 @@ import { SessionManager } from "./session/manager.ts";
 import { AgentRuntime } from "./runtime/agent.ts";
 import { acquirePidFile } from "./runtime/pid.ts";
 import { buildBaseSystemPrompt } from "./runtime/system-prompt.ts";
+import { closeDatabase, getDatabase } from "./db/database.ts";
 
 async function main(): Promise<void> {
   const agentHome = resolveAgentHome();
@@ -28,12 +29,14 @@ async function main(): Promise<void> {
     }
 
     await adapter?.stop();
+    closeDatabase();
     await pidLock.release();
     process.exit(0);
   };
 
   try {
     const config = await loadConfig();
+    getDatabase({ agentHome: config.agentHome });
     adapter = new WebSocketCommunicationAdapter({
       port: config.communication.port,
     });
@@ -46,7 +49,10 @@ async function main(): Promise<void> {
       sessionManager: new SessionManager({
         buildSystemPrompt: buildBaseSystemPrompt,
       }),
-      primitiveDispatcher: new PrimitiveDispatcher(),
+      primitiveDispatcher: new PrimitiveDispatcher({
+        agentHome: config.agentHome,
+        workspaceDir: process.cwd(),
+      }),
     });
     runtime.start();
 
@@ -63,6 +69,7 @@ async function main(): Promise<void> {
     console.log(`Model: ${config.llm.model}`);
   } catch (error) {
     await adapter?.stop();
+    closeDatabase();
     await pidLock.release();
     console.error(toErrorMessage(error));
     process.exit(1);

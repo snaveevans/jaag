@@ -2,6 +2,33 @@
 
 This file is a running log of small-but-annoying issues we've hit, plus the fix that worked.
 
+## 2026-03-21 - Strict TS dislikes mixed nullish/or chains and overly-wide helper returns
+
+### Symptom
+
+- `bun run typecheck` failed during Slice 02 with `?? and || operations cannot be mixed without parentheses` in path resolution code.
+- The same pass also failed when a domain parser returned `string | null | undefined` but a memory helper required `string | null`.
+
+### Cause
+
+- TypeScript treats mixed `??` / `||` expressions as ambiguous unless they are parenthesized or simplified.
+- Reusing one parser for both "scoped domain" and "optional filter" cases widened the return type beyond what keyed memory operations accepted.
+
+### Fix
+
+- Replace the mixed fallback expression with a single nullish chain in `src/primitives/file.ts`.
+- Add a dedicated `parseScopedDomain()` wrapper in `src/primitives/memory.ts` so keyed operations always receive `string | null`.
+
+### How to avoid next time
+
+- In strict TypeScript, do not mix `??` with `||` in one expression; pick one operator family or add explicit grouping.
+- When one helper serves both optional-filter and required-scoped cases, add a narrow wrapper instead of pushing a wider union through every call site.
+
+### Evidence (optional)
+
+- Fixed files: `src/primitives/file.ts`, `src/primitives/memory.ts`
+- Validation: `bun run typecheck`
+
 ## 2026-03-20 - Bun CLI helpers should use process.exit and close codes
 
 ### Symptom
