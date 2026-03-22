@@ -2,6 +2,33 @@
 
 This file is a running log of small-but-annoying issues we've hit, plus the fix that worked.
 
+## 2026-03-21 - Concurrent prompts need a queue, and cron metadata updates must not retime schedules
+
+### Symptom
+
+- Concurrent triggered sessions that both called `interact` could fail the second run with `Another user prompt is already waiting for a response.` instead of waiting for the first prompt to finish.
+- Updating only cron schedule metadata could recompute `next_fire_at` from `now`, which could skip a run that was already due.
+
+### Cause
+
+- `src/runtime/agent.ts` only tracked one in-flight prompt and rejected every overlapping request immediately.
+- `src/scheduler/store.ts` always recomputed active cron timing during updates, even when the trigger and status semantics had not changed.
+
+### Fix
+
+- Queue prompt requests globally, activate them one at a time, and start the reply timeout only when a prompt becomes active.
+- Preserve `next_fire_at` when an update keeps the same trigger timing and status, and recompute only when the trigger or status transition changes scheduling semantics.
+- Updated files: `src/runtime/agent.ts`, `src/runtime/agent.test.ts`, `src/scheduler/store.ts`, `src/scheduler/store.test.ts`
+
+### How to avoid next time
+
+- When transport only supports one uncorrelated reply at a time, serialize prompt requests instead of failing overlapping background work.
+- Treat schedule metadata edits separately from timing edits so due work is not silently pushed forward.
+
+### Evidence (optional)
+
+- Validation: `bun test src/runtime/agent.test.ts src/scheduler/store.test.ts`; `bun test`; `bun run typecheck`
+
 ## 2026-03-21 - Symlink-aware path checks and prompt state must be installed before async sends
 
 ### Symptom
