@@ -12,6 +12,7 @@ import {
   type AgentConfig,
   type RawAgentConfigFile,
 } from "./schema.ts";
+import { assertValidTimeZone } from "../scheduler/cron.ts";
 
 export class ConfigError extends Error {
   constructor(message: string) {
@@ -73,6 +74,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Agent
 
   const llm = parsed.llm ?? {};
   const communication = parsed.communication ?? {};
+  const runtime = parsed.runtime ?? {};
 
   const provider = requireString(llm.provider, "llm.provider");
   if (provider !== "openai") {
@@ -96,6 +98,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Agent
   const maxOutputTokens = requireInteger(llm.max_output_tokens, "llm.max_output_tokens", { min: 1 });
   const temperature = requireNumber(llm.temperature, "llm.temperature");
   const communicationType = requireString(communication.type, "communication.type");
+  const timeZone = runtime.timezone === undefined ? "UTC" : requireString(runtime.timezone, "runtime.timezone");
 
   if (communicationType !== "websocket") {
     throw new ConfigError(
@@ -116,6 +119,9 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Agent
       temperature,
       apiKeyEnv,
       apiKey,
+    },
+    runtime: {
+      timezone: assertValidTimeZone(timeZone),
     },
     communication: {
       type: "websocket",

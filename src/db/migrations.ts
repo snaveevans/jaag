@@ -72,5 +72,43 @@ export function runDatabaseMigrations(database: Database): void {
     )
   `);
 
+  database.run(`
+    CREATE TABLE IF NOT EXISTS schedules (
+      id TEXT PRIMARY KEY,
+      workflow TEXT NOT NULL,
+      group_label TEXT,
+      trigger_type TEXT NOT NULL,
+      trigger_config TEXT NOT NULL,
+      context TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_fired_at TEXT,
+      next_fire_at TEXT,
+      fire_count INTEGER NOT NULL DEFAULT 0,
+      last_fire_status TEXT
+    ) STRICT
+  `);
+
+  database.run(`
+    CREATE INDEX IF NOT EXISTS idx_schedules_status
+    ON schedules(status)
+  `);
+
+  database.run(`
+    CREATE INDEX IF NOT EXISTS idx_schedules_workflow
+    ON schedules(workflow)
+  `);
+
+  database.run(`
+    CREATE INDEX IF NOT EXISTS idx_schedules_group
+    ON schedules(group_label)
+  `);
+
+  database.run(`
+    CREATE INDEX IF NOT EXISTS idx_schedules_next_fire
+    ON schedules(next_fire_at)
+  `);
+
   database.run(`INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')`);
 }

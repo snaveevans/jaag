@@ -138,7 +138,7 @@ describe("policy engine", () => {
       hasApprovalReceipt: () => true,
       requestApproval: async () => {
         approvalPrompts += 1;
-        return true;
+        return { approved: true, response: "yes" };
       },
     });
 
@@ -153,6 +153,40 @@ describe("policy engine", () => {
 
     expect(result).toMatchObject({ action: "allow", source: "receipt" });
     expect(approvalPrompts).toBe(0);
+  });
+
+  test("distinguishes ambiguous approval replies from explicit denials", async () => {
+    const { engine } = createHarness([
+      {
+        id: "rule-1",
+        primitive: "http",
+        action: "approve",
+        match: { method: ["POST"] },
+        modelApprovalSufficient: false,
+      },
+    ], {
+      requestApproval: async () => ({
+        approved: null,
+        response: "maybe",
+        error: "Unrecognized approval response: expected yes or no.",
+      }),
+    });
+
+    const result = await engine.enforce({
+      primitive: "http",
+      domain: "example.test",
+      path: "/messages",
+      method: "POST",
+      tool: "mockmail",
+      operation: "messages.send",
+    }, SESSION_CONTEXT);
+
+    if (result.action !== "block") {
+      throw new Error("Expected ambiguous approval to block the action.");
+    }
+    expect(result.reason).toContain("Approval response was unrecognized");
+    expect(result.reason).toContain('"maybe"');
+    expect(result.reason).not.toContain("User denied");
   });
 
   test("matches http domain, method, trust tier, and operation fields", async () => {
@@ -212,7 +246,7 @@ function createHarness(
   const interactionHandler: InteractionHandler = {
     notify: async () => ({ delivered: true }),
     ask: async () => "ok",
-    requestApproval: async () => true,
+    requestApproval: async () => ({ approved: true, response: "yes" }),
     hasApprovalReceipt: () => false,
     ...interactionOverrides,
   };

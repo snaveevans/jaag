@@ -9,6 +9,7 @@ export interface PrimitiveResult {
 
 export interface PrimitiveContext {
   sessionId: string;
+  triggerSource?: "user" | "schedule";
 }
 
 export interface PromptOptions {
@@ -22,6 +23,12 @@ export interface ApprovalRequestOptions extends PromptOptions {
   recordReceipt?: boolean;
 }
 
+export interface ApprovalDecision {
+  approved: boolean | null;
+  response: string | null;
+  error?: string;
+}
+
 export interface ApprovalReceiptLookup {
   tool: string;
   operation: string;
@@ -32,14 +39,24 @@ export interface ApprovalReceiptLookup {
 export interface InteractionHandler {
   notify(message: string, context: PrimitiveContext): Promise<DeliveryResult>;
   ask(message: string, context: PrimitiveContext, options?: PromptOptions): Promise<string>;
-  requestApproval(message: string, context: PrimitiveContext, options?: ApprovalRequestOptions): Promise<boolean>;
+  requestApproval(message: string, context: PrimitiveContext, options?: ApprovalRequestOptions): Promise<ApprovalDecision>;
   hasApprovalReceipt(context: PrimitiveContext, criteria: ApprovalReceiptLookup): boolean;
+}
+
+export class InteractionTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InteractionTimeoutError";
+  }
 }
 
 export type PrimitiveHandler = (
   params: Record<string, unknown>,
   context: PrimitiveContext,
 ) => Promise<PrimitiveResult>;
+
+const SCHEDULE_STATUS_ENUM = ["active", "paused", "completed", "failed"];
+const SCHEDULE_FILTER_TRIGGER_TYPE_ENUM = ["cron", "once", "event"];
 
 export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
   {
@@ -139,25 +156,134 @@ export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
     parameters: {
       type: "object",
       properties: {
-        operation: { type: "string", description: "Schedule operation such as create, get, list, or delete." },
+        operation: {
+          type: "string",
+          enum: ["create", "get", "list", "update", "delete"],
+          description: "Schedule operation to perform.",
+        },
+        schedule_id: {
+          type: "string",
+          description: "Schedule identifier used by get, update, or delete. Alias of id.",
+        },
+        id: {
+          type: "string",
+          description: "Schedule identifier used by get, update, or delete. Alias of schedule_id.",
+        },
+        workflow: {
+          type: "string",
+          description: "Workflow name associated with the schedule.",
+        },
+        group: {
+          type: ["string", "null"],
+          description: "Optional group label for create/update, or group selector for delete.",
+        },
+        trigger: {
+          type: "object",
+          description: "Trigger definition for create or update operations.",
+          properties: {
+            type: {
+              type: "string",
+              enum: ["cron", "once"],
+              description: "Supported trigger type.",
+            },
+            cron: {
+              type: "string",
+              description: "Cron expression for cron schedules. Alias of trigger.expression.",
+            },
+            expression: {
+              type: "string",
+              description: "Cron expression for cron schedules.",
+            },
+            at: {
+              type: "string",
+              description: "RFC 3339 timestamp for once schedules.",
+            },
+            description: {
+              type: "string",
+              description: "Optional human-readable description for the trigger.",
+            },
+          },
+          required: ["type"],
+          additionalProperties: false,
+        },
+        instruction: {
+          type: "string",
+          description: "Instruction for the scheduled workflow. Can also be supplied as context.instruction.",
+        },
+        context: {
+          type: "object",
+          description: "Schedule context payload merged into the triggered session.",
+          properties: {
+            instruction: {
+              type: "string",
+              description: "Instruction for the scheduled workflow when provided inside context.",
+            },
+          },
+          additionalProperties: true,
+        },
+        status: {
+          type: "string",
+          enum: SCHEDULE_STATUS_ENUM,
+          description: "Schedule status for create, update, or list filtering.",
+        },
+        trigger_type: {
+          type: "string",
+          enum: SCHEDULE_FILTER_TRIGGER_TYPE_ENUM,
+          description: "Optional top-level trigger type filter for list operations.",
+        },
+        filters: {
+          type: "object",
+          description: "Optional list filters. Top-level workflow/group/status/trigger_type are also accepted.",
+          properties: {
+            workflow: {
+              type: "string",
+              description: "Filter schedules by workflow.",
+            },
+            group: {
+              type: "string",
+              description: "Filter schedules by group label.",
+            },
+            status: {
+              type: "string",
+              enum: SCHEDULE_STATUS_ENUM,
+              description: "Filter schedules by status.",
+            },
+            trigger_type: {
+              type: "string",
+              enum: SCHEDULE_FILTER_TRIGGER_TYPE_ENUM,
+              description: "Filter schedules by trigger type.",
+            },
+          },
+          additionalProperties: false,
+        },
       },
       required: ["operation"],
-      additionalProperties: true,
+      additionalProperties: false,
     },
   },
   {
     name: "interact",
-    description: "Ask the user a question, show a notification, or request approval.",
+    description: "Ask the user a question, show a notification, or request approval. For approval requests, instruct the user to reply exactly yes or no.",
     parameters: {
       type: "object",
       properties: {
-        mode: { type: "string", description: "Interaction mode: ask, notify, or approve." },
+        mode: {
+          type: "string",
+          enum: ["notify", "ask", "approve"],
+          description: "Interaction mode to perform.",
+        },
         message: { type: "string", description: "Text shown to the user." },
-        tool: { type: "string", description: "Optional tool id associated with an approval request." },
-        operation: { type: "string", description: "Optional tool operation associated with an approval request." },
+        tool: {
+          type: "string",
+          description: "Optional tool id associated with an approval request.",
+        },
+        operation: {
+          type: "string",
+          description: "Optional tool operation associated with an approval request.",
+        },
       },
       required: ["mode", "message"],
-      additionalProperties: true,
+      additionalProperties: false,
     },
   },
 ];

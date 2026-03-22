@@ -1,10 +1,17 @@
 import { dirname } from "node:path";
-import type { PrimitiveContext, PrimitiveHandler, PrimitiveResult, InteractionHandler } from "./types.ts";
+import {
+  InteractionTimeoutError,
+  type PrimitiveContext,
+  type PrimitiveHandler,
+  type PrimitiveResult,
+  type InteractionHandler,
+} from "./types.ts";
 import { RAW_PRIMITIVE_DECLARATIONS } from "./types.ts";
 import { DEFAULT_AGENT_HOME } from "../config/schema.ts";
 import { getDatabase } from "../db/database.ts";
 import { createFileReadHandler, createFileWriteHandler, resolveEffectiveFilePath, type FileHandlerOptions } from "./file.ts";
 import { createMemoryHandler } from "./memory.ts";
+import { createScheduleHandler } from "./schedule.ts";
 import type { AuthDependencies } from "../interpreter/auth.ts";
 import { ToolSpecRegistry } from "../specs/registry.ts";
 import { ToolSpecInterpreter } from "../interpreter/pipeline.ts";
@@ -21,12 +28,14 @@ export interface PrimitiveDispatcherOptions {
   agentHome?: string;
   workspaceDir?: string;
   homeDir?: string;
+  timeZone?: string;
   policyPath?: string;
   policy?: LoadedPolicy;
   getDatabase?: typeof getDatabase;
   env?: Record<string, string | undefined>;
   fetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  now?: () => Date;
   seedTrustedSpecs?: boolean;
 }
 
@@ -90,6 +99,11 @@ export class PrimitiveDispatcher {
       file_read: createFileReadHandler(fileHandlerOptions),
       file_write: createFileWriteHandler(fileHandlerOptions),
       memory: memoryHandler,
+      schedule: createScheduleHandler({
+        getDatabase: () => runtimeDatabase,
+        now: options.now,
+        timeZone: options.timeZone,
+      }),
       interact: createInteractHandler(() => this.interactionHandler),
     };
   }
@@ -279,7 +293,7 @@ function createInteractHandler(getInteractionHandler: () => InteractionHandler |
           };
         }
         case "approve": {
-          const approved = await interactionHandler.requestApproval(message, context, {
+          const decision = await interactionHandler.requestApproval(message, context, {
             tool: optionalStringParam(params.tool),
             operation: optionalStringParam(params.operation),
             summary: message,
@@ -287,7 +301,7 @@ function createInteractHandler(getInteractionHandler: () => InteractionHandler |
           });
           return {
             success: true,
-            data: { approved },
+            data: decision,
           };
         }
         default:
@@ -297,6 +311,30 @@ function createInteractHandler(getInteractionHandler: () => InteractionHandler |
           };
       }
     } catch (error) {
+      if (context.triggerSource === "schedule" && error instanceof InteractionTimeoutError) {
+        const mode = optionalStringParam(params.mode);
+        if (mode === "approve") {
+          return {
+            success: true,
+            data: {
+              approved: null,
+              response: null,
+              timedOut: true,
+            },
+          };
+        }
+
+        if (mode === "ask") {
+          return {
+            success: true,
+            data: {
+              response: null,
+              timedOut: true,
+            },
+          };
+        }
+      }
+
       return {
         success: false,
         error: toErrorMessage(error),
@@ -344,7 +382,7 @@ async function buildPrimitivePolicyContext(
       case "schedule":
         return {
           primitive: "schedule",
-          trigger_type: optionalStringParam(params.trigger_type),
+          trigger_type: extractScheduleTriggerType(params),
         };
       default:
         return null;
@@ -352,6 +390,20 @@ async function buildPrimitivePolicyContext(
   } catch {
     return null;
   }
+}
+
+function extractScheduleTriggerType(params: Record<string, unknown>): string | undefined {
+  const directType = optionalStringParam(params.trigger_type);
+  if (directType) {
+    return directType;
+  }
+
+  const rawTrigger = params.trigger;
+  if (!rawTrigger || typeof rawTrigger !== "object" || Array.isArray(rawTrigger)) {
+    return undefined;
+  }
+
+  return optionalStringParam((rawTrigger as Record<string, unknown>).type);
 }
 
 function buildOperationPolicyContext(

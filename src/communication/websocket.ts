@@ -6,12 +6,18 @@ interface WebSocketAdapterOptions {
   hostname?: string;
 }
 
+interface DeliveryDeferred {
+  promise: Promise<void>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+}
+
 type QueuedEvent =
-  | { type: "message"; payload: OutboundMessage }
-  | { type: "stream_chunk"; payload: { sessionId: string; content: string } };
+  | { type: "message"; payload: OutboundMessage; deliveryDeferred: DeliveryDeferred }
+  | { type: "stream_chunk"; payload: { sessionId: string; content: string }; deliveryDeferred: DeliveryDeferred };
 
 type ClientEnvelope =
-  | { type: "message"; content: string }
+  | { type: "message"; content: string; replyToPromptId?: string; reply_to_prompt_id?: string }
   | { type: string; [key: string]: unknown };
 
 type ServerEnvelope =
@@ -77,6 +83,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
           this.messageHandler?.({
             content: envelope.content,
             timestamp: new Date(),
+            replyToPromptId: getReplyToPromptId(envelope),
           });
         },
         close: (socket) => {
@@ -89,19 +96,29 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   }
 
   async stop(): Promise<void> {
+    while (this.outboundQueue.length > 0) {
+      const queuedEvent = this.outboundQueue.shift();
+      queuedEvent?.deliveryDeferred.reject(new Error("WebSocket adapter stopped before queued event delivery."));
+    }
+
     this.socket = null;
     this.server?.stop(true);
     this.server = undefined;
   }
 
   async send(message: OutboundMessage): Promise<DeliveryResult> {
-    return this.enqueueOrSend({ type: "message", payload: message });
+    return this.enqueueOrSend({
+      type: "message",
+      payload: message,
+      deliveryDeferred: createDeliveryDeferred(),
+    });
   }
 
   async sendStreamChunk(sessionId: string, content: string): Promise<DeliveryResult> {
     return this.enqueueOrSend({
       type: "stream_chunk",
       payload: { sessionId, content },
+      deliveryDeferred: createDeliveryDeferred(),
     });
   }
 
@@ -127,18 +144,24 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
       return {
         delivered: false,
         queuePosition: this.outboundQueue.length,
+        whenDelivered: event.deliveryDeferred.promise,
       };
     }
 
     try {
       this.socket.send(JSON.stringify(toServerEnvelope(event)));
-      return { delivered: true };
+      event.deliveryDeferred.resolve();
+      return {
+        delivered: true,
+        whenDelivered: event.deliveryDeferred.promise,
+      };
     } catch {
       this.socket = null;
       this.outboundQueue.push(event);
       return {
         delivered: false,
         queuePosition: this.outboundQueue.length,
+        whenDelivered: event.deliveryDeferred.promise,
       };
     }
   }
@@ -152,6 +175,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
       try {
         this.socket.send(JSON.stringify(toServerEnvelope(nextEvent)));
+        nextEvent.deliveryDeferred.resolve();
       } catch {
         this.outboundQueue.unshift(nextEvent);
         this.socket = null;
@@ -174,6 +198,33 @@ function toServerEnvelope(event: QueuedEvent): ServerEnvelope {
     sessionId: event.payload.sessionId,
     content: event.payload.content,
   };
+}
+
+function getReplyToPromptId(envelope: ClientEnvelope): string | undefined {
+  const replyToPromptId = "replyToPromptId" in envelope ? envelope.replyToPromptId : undefined;
+  if (typeof replyToPromptId === "string" && replyToPromptId.trim() !== "") {
+    return replyToPromptId.trim();
+  }
+
+  const snakeCaseReplyToPromptId = "reply_to_prompt_id" in envelope ? envelope.reply_to_prompt_id : undefined;
+  if (typeof snakeCaseReplyToPromptId === "string" && snakeCaseReplyToPromptId.trim() !== "") {
+    return snakeCaseReplyToPromptId.trim();
+  }
+
+  return undefined;
+}
+
+function createDeliveryDeferred(): DeliveryDeferred {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+
+  const promise = new Promise<void>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = (error: Error) => promiseReject(error);
+  });
+  void promise.catch(() => {});
+
+  return { promise, resolve, reject };
 }
 
 function normalizeWebSocketPayload(payload: string | ArrayBuffer | Uint8Array): string {

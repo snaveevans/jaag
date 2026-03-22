@@ -26,12 +26,14 @@ describe("WebSocketCommunicationAdapter", () => {
       content: "queued",
     });
 
-    expect(delivery).toEqual({ delivered: false, queuePosition: 1 });
+    expect(delivery).toMatchObject({ delivered: false, queuePosition: 1 });
+    expect(delivery.whenDelivered).toBeInstanceOf(Promise);
 
     const client = await connect(adapter.getUrl());
     sockets.push(client);
 
     const event = await waitForJsonMessage(client);
+    await expect(delivery.whenDelivered).resolves.toBeUndefined();
     expect(event).toEqual({
       type: "message",
       sessionId: "session-1",
@@ -45,15 +47,43 @@ describe("WebSocketCommunicationAdapter", () => {
     adapters.push(adapter);
     await adapter.start();
 
-    const received = new Promise<string>((resolve) => {
-      adapter.onMessage((message) => resolve(message.content));
+    const received = new Promise<{ content: string; replyToPromptId?: string }>((resolve) => {
+      adapter.onMessage((message) => resolve({ content: message.content, replyToPromptId: message.replyToPromptId }));
     });
 
     const client = await connect(adapter.getUrl());
     sockets.push(client);
-    client.send(JSON.stringify({ type: "message", content: "hello daemon" }));
+    client.send(JSON.stringify({ type: "message", content: "hello daemon", replyToPromptId: "prompt-123" }));
 
-    expect(await received).toBe("hello daemon");
+    expect(await received).toEqual({ content: "hello daemon", replyToPromptId: "prompt-123" });
+  });
+
+  test("includes prompt ids on outbound prompt messages", async () => {
+    const adapter = new WebSocketCommunicationAdapter({ port: 0 });
+    adapters.push(adapter);
+    await adapter.start();
+
+    const client = await connect(adapter.getUrl());
+    sockets.push(client);
+
+    const delivery = await adapter.send({
+      sessionId: "session-1",
+      mode: "ask",
+      content: "Need input.",
+      promptId: "prompt-123",
+    });
+
+    expect(delivery).toMatchObject({ delivered: true });
+    await expect(delivery.whenDelivered).resolves.toBeUndefined();
+
+    const event = await waitForJsonMessage(client);
+    expect(event).toEqual({
+      type: "message",
+      sessionId: "session-1",
+      mode: "ask",
+      content: "Need input.",
+      promptId: "prompt-123",
+    });
   });
 });
 

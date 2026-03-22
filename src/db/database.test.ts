@@ -59,6 +59,39 @@ describe("initializeDatabase", () => {
     ]);
     const rateLimitCount = database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM rate_limits").get();
     expect(rateLimitCount?.count).toBe(1);
+
+    database.run(
+      `
+        INSERT INTO schedules (
+          id,
+          workflow,
+          group_label,
+          trigger_type,
+          trigger_config,
+          context,
+          status,
+          created_at,
+          updated_at,
+          next_fire_at,
+          fire_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        "schedule-1",
+        "hydration",
+        "wellness",
+        "once",
+        JSON.stringify({ at: "2026-03-21T01:00:00.000Z" }),
+        JSON.stringify({ instruction: "Remind the user to drink water." }),
+        "active",
+        now,
+        now,
+        "2026-03-21T01:00:00.000Z",
+        0,
+      ],
+    );
+    const scheduleCount = database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schedules").get();
+    expect(scheduleCount?.count).toBe(1);
   });
 });
 

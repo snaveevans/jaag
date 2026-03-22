@@ -11,18 +11,22 @@ const url = process.env.AGENT_WS_URL?.trim() || DEFAULT_URL;
 const idleMs = resolveIdleMs(process.env.AGENT_WS_IDLE_MS);
 let streamingSessionId: string | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
+let activePromptId: string | null = null;
+let activePromptMode: string | null = null;
+let promptLoopStarted = false;
 
 const socket = new WebSocket(url);
 
 socket.addEventListener("open", () => {
   console.log(`Connected to ${url}`);
-  console.log(`Sent prompt: ${prompt}`);
+  console.log(`Sent initial prompt: ${prompt}`);
   if (idleMs > 0) {
-    console.log(`Waiting for streamed chunks and messages. Auto-close after ${idleMs}ms idle.`);
+    console.log(`Waiting for streamed chunks and messages. Type replies in stdin. Auto-close after ${idleMs}ms idle.`);
   } else {
-    console.log("Waiting for streamed chunks and messages. Press Ctrl-C to exit.");
+    console.log("Waiting for streamed chunks and messages. Type replies in stdin. Press Ctrl-C to exit.");
   }
   socket.send(JSON.stringify({ type: "message", content: prompt }));
+  startPromptLoop();
 });
 
 socket.addEventListener("message", async (event) => {
@@ -54,6 +58,16 @@ socket.addEventListener("message", async (event) => {
   if (envelope.type === "message" && typeof envelope.content === "string") {
     const mode = typeof envelope.mode === "string" ? envelope.mode : "unknown";
     const sessionId = typeof envelope.sessionId === "string" ? envelope.sessionId : "unknown-session";
+    const promptId = getPromptId(envelope);
+
+    if ((mode === "ask" || mode === "approve") && promptId) {
+      activePromptId = promptId;
+      activePromptMode = mode;
+      console.log(`[prompt ${mode} ${sessionId} ${promptId}] ${envelope.content}`);
+      console.log(`reply> `);
+      return;
+    }
+
     console.log(`[message ${mode} ${sessionId}] ${envelope.content}`);
     return;
   }
@@ -86,6 +100,58 @@ process.on("SIGINT", () => {
   finishStreamLine();
   socket.close(1000, "Client exiting");
 });
+
+function startPromptLoop(): void {
+  if (promptLoopStarted) {
+    return;
+  }
+
+  promptLoopStarted = true;
+  process.stdin.setEncoding("utf8");
+  process.stdin.resume();
+
+  let buffer = "";
+  process.stdin.on("data", (chunk) => {
+    buffer += chunk;
+
+    while (buffer.includes("\n")) {
+      const newlineIndex = buffer.indexOf("\n");
+      const rawLine = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      void handleInputLine(rawLine.replace(/\r$/, ""));
+    }
+  });
+}
+
+async function handleInputLine(line: string): Promise<void> {
+  const trimmed = line.trim();
+  if (trimmed === "") {
+    return;
+  }
+
+  if (socket.readyState !== WebSocket.OPEN) {
+    console.error("Socket is not open; cannot send input.");
+    return;
+  }
+
+  const payload: Record<string, unknown> = {
+    type: "message",
+    content: trimmed,
+  };
+
+  if (activePromptId) {
+    payload.replyToPromptId = activePromptId;
+    if (activePromptMode === "approve") {
+      console.log(`[reply ${activePromptId}] ${trimmed}`);
+    }
+  } else {
+    console.log(`[message] ${trimmed}`);
+  }
+
+  socket.send(JSON.stringify(payload));
+  activePromptId = null;
+  activePromptMode = null;
+}
 
 function scheduleIdleClose(): void {
   if (idleMs === 0) {
@@ -145,6 +211,20 @@ function parseEnvelope(raw: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function getPromptId(envelope: Record<string, unknown>): string | null {
+  const promptId = envelope.promptId;
+  if (typeof promptId === "string" && promptId.trim() !== "") {
+    return promptId.trim();
+  }
+
+  const snakeCasePromptId = envelope.prompt_id;
+  if (typeof snakeCasePromptId === "string" && snakeCasePromptId.trim() !== "") {
+    return snakeCasePromptId.trim();
+  }
+
+  return null;
 }
 
 function resolveIdleMs(rawValue: string | undefined): number {

@@ -1,9 +1,16 @@
 import { AgentSession } from "./session.ts";
+import type { TriggeredScheduleContext } from "../scheduler/types.ts";
+
+export interface BuildSystemPromptInput {
+  now: Date;
+  triggerSource: "user" | "schedule";
+  triggeredSchedule?: TriggeredScheduleContext;
+}
 
 export interface SessionManagerOptions {
   inactivityTimeoutMs?: number;
   maxIterations?: number;
-  buildSystemPrompt?: (now: Date) => string;
+  buildSystemPrompt?: (input: BuildSystemPromptInput) => string;
 }
 
 export class SessionManager {
@@ -11,7 +18,7 @@ export class SessionManager {
   private interactiveSessionId: string | null = null;
   private readonly inactivityTimeoutMs: number;
   private readonly maxIterations: number;
-  private readonly buildSystemPrompt: (now: Date) => string;
+  private readonly buildSystemPrompt: (input: BuildSystemPromptInput) => string;
 
   constructor(options: SessionManagerOptions) {
     this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 10 * 60 * 1000;
@@ -28,7 +35,10 @@ export class SessionManager {
     }
 
     const session = new AgentSession({
-      systemPrompt: this.buildSystemPrompt(now),
+      systemPrompt: this.buildSystemPrompt({
+        now,
+        triggerSource: "user",
+      }),
       triggerSource: "user",
       createdAt: now,
       inactivityTimeoutMs: this.inactivityTimeoutMs,
@@ -37,6 +47,23 @@ export class SessionManager {
 
     this.sessions.set(session.id, session);
     this.interactiveSessionId = session.id;
+    return session;
+  }
+
+  createTriggeredSession(triggeredSchedule: TriggeredScheduleContext, now = new Date()): AgentSession {
+    const session = new AgentSession({
+      systemPrompt: this.buildSystemPrompt({
+        now,
+        triggerSource: "schedule",
+        triggeredSchedule,
+      }),
+      triggerSource: "schedule",
+      createdAt: now,
+      inactivityTimeoutMs: this.inactivityTimeoutMs,
+      maxIterations: this.maxIterations,
+    });
+
+    this.sessions.set(session.id, session);
     return session;
   }
 

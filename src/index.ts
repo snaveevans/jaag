@@ -2,6 +2,8 @@ import { loadConfig, resolveAgentHome } from "./config/loader.ts";
 import { WebSocketCommunicationAdapter } from "./communication/websocket.ts";
 import { OpenAICompatibleProvider } from "./llm/openai.ts";
 import { PrimitiveDispatcher } from "./primitives/dispatcher.ts";
+import { ScheduleStore } from "./scheduler/store.ts";
+import { SchedulerService } from "./scheduler/service.ts";
 import { SessionManager } from "./session/manager.ts";
 import { AgentRuntime } from "./runtime/agent.ts";
 import { acquirePidFile } from "./runtime/pid.ts";
@@ -13,6 +15,7 @@ async function main(): Promise<void> {
   const pidLock = await acquirePidFile(`${agentHome}/agent.pid`);
   let adapter: WebSocketCommunicationAdapter | undefined;
   let runtime: AgentRuntime | undefined;
+  let scheduler: SchedulerService | undefined;
   let shuttingDown = false;
 
   const shutdown = async (signal: string): Promise<void> => {
@@ -23,6 +26,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log(`Received ${signal}. Shutting down...`);
 
+    await scheduler?.stop();
     const completed = await runtime?.shutdown(30_000);
     if (completed === false) {
       console.warn("Shutdown timed out while waiting for the active session to finish.");
@@ -39,6 +43,7 @@ async function main(): Promise<void> {
     getDatabase({ agentHome: config.agentHome });
     const primitiveDispatcher = new PrimitiveDispatcher({
       agentHome: config.agentHome,
+      timeZone: config.runtime.timezone,
       workspaceDir: process.cwd(),
     });
     adapter = new WebSocketCommunicationAdapter({
@@ -51,15 +56,26 @@ async function main(): Promise<void> {
       llmProvider: new OpenAICompatibleProvider(),
       modelConfig: config.llm,
       sessionManager: new SessionManager({
-        buildSystemPrompt: (now) => buildBaseSystemPrompt({
+        buildSystemPrompt: ({ now, triggeredSchedule }) => buildBaseSystemPrompt({
           now,
           policySummary: primitiveDispatcher.getPolicySummary(),
+          timeZone: config.runtime.timezone,
           toolManifests: primitiveDispatcher.listToolManifests(),
+          triggeredSchedule,
         }),
       }),
       primitiveDispatcher,
     });
     runtime.start();
+
+    scheduler = new SchedulerService({
+      store: new ScheduleStore({
+        database: getDatabase({ agentHome: config.agentHome }),
+        timeZone: config.runtime.timezone,
+      }),
+      launchSchedule: async (schedule, firedAt) => await runtime!.launchTriggeredSchedule(schedule, firedAt),
+    });
+    await scheduler.start();
 
     process.on("SIGINT", () => {
       void shutdown("SIGINT");
@@ -72,7 +88,9 @@ async function main(): Promise<void> {
     console.log(`Config: ${config.configPath}`);
     console.log(`Port: ${adapter.getPort()}`);
     console.log(`Model: ${config.llm.model}`);
+    console.log(`Timezone: ${config.runtime.timezone}`);
   } catch (error) {
+    await scheduler?.stop();
     await adapter?.stop();
     closeDatabase();
     await pidLock.release();

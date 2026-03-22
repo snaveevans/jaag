@@ -42,6 +42,34 @@ communication:
     expect(config.llm.apiKey).toBe("test-key");
     expect(config.llm.baseUrl).toBe("https://api.openai.com/v1");
     expect(config.communication.port).toBe(8765);
+    expect(config.runtime.timezone).toBe("UTC");
+  });
+
+  test("loads a configured runtime timezone", async () => {
+    const homeDir = await createHomeDir();
+    await writeAgentConfig(
+      homeDir,
+      `llm:
+  provider: openai
+  model: gpt-4o-mini
+  context_limit: 128000
+  max_output_tokens: 4096
+  temperature: 0
+  api_key_env: OPENAI_API_KEY
+communication:
+  type: websocket
+  port: 8765
+runtime:
+  timezone: America/New_York
+`,
+    );
+
+    const config = await loadConfig({
+      homeDir,
+      env: { OPENAI_API_KEY: "test-key" },
+    });
+
+    expect(config.runtime.timezone).toBe("America/New_York");
   });
 
   test("fails with instructional error when config is missing", async () => {

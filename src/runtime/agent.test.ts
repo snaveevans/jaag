@@ -49,8 +49,8 @@ class FakeAdapter implements CommunicationAdapter {
     return { delivered: true };
   }
 
-  dispatchInbound(content: string, timestamp = new Date()): void {
-    this.handler?.({ content, timestamp });
+  dispatchInbound(content: string, timestamp = new Date(), replyToPromptId?: string): void {
+    this.handler?.({ content, timestamp, replyToPromptId });
   }
 }
 
@@ -69,6 +69,34 @@ class PromptReplyingAdapter extends FakeAdapter {
     }
 
     return { delivered: true };
+  }
+}
+
+class QueuedDeliveryAdapter extends FakeAdapter {
+  private queuedDeliveryResolvers: Array<() => void> = [];
+
+  override async send(message: OutboundMessage): Promise<DeliveryResult> {
+    this.sentMessages.push(message);
+
+    if (message.mode === "ask" || message.mode === "approve") {
+      let resolveDelivery!: () => void;
+      const whenDelivered = new Promise<void>((resolve) => {
+        resolveDelivery = resolve;
+      });
+      this.queuedDeliveryResolvers.push(resolveDelivery);
+      return {
+        delivered: false,
+        queuePosition: this.queuedDeliveryResolvers.length,
+        whenDelivered,
+      };
+    }
+
+    return { delivered: true };
+  }
+
+  markNextPromptDelivered(): void {
+    const resolveDelivery = this.queuedDeliveryResolvers.shift();
+    resolveDelivery?.();
   }
 }
 
@@ -313,6 +341,231 @@ class InteractAskThenTextProvider implements LLMProvider {
     expect(latestToolResult?.content).toContain('"response":"instant reply"');
 
     yield { type: "text", content: "Prompt round-trip complete." };
+    yield { type: "done" };
+  }
+}
+
+class CorrelatedAskThenTextProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"ask","message":"Need the correlated reply."}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    if (this.callCount === 2) {
+      const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+      expect(latestToolResult?.content).toContain('"response":"correct reply"');
+      yield { type: "text", content: "Prompt used the matching reply." };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
+    expect(latestUserMessage?.content).toBe("wrong reply");
+    yield { type: "text", content: "Handled unmatched inbound message." };
+    yield { type: "done" };
+  }
+}
+
+class DeliveryAwareTriggeredAskProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"ask","message":"Reply after delivery."}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"response":"delivered reply"');
+    expect(latestToolResult?.content).not.toContain('"timedOut":true');
+
+    yield { type: "text", content: "Prompt waited for delivery." };
+    yield { type: "done" };
+  }
+}
+
+class InteractAmbiguousApproveProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"approve","message":"Proceed with the operation?"}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"approved":null');
+    expect(latestToolResult?.content).toContain('"response":"maybe"');
+    expect(latestToolResult?.content).toContain("Unrecognized approval response");
+
+    yield { type: "text", content: "Ambiguous approval surfaced." };
+    yield { type: "done" };
+  }
+}
+
+class TriggeredMemoryProvider implements LLMProvider {
+  callCount = 0;
+  systemPrompts: string[] = [];
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+    this.systemPrompts.push(messages[0]?.content ?? "");
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "memory", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "memory",
+          arguments: '{"operation":"set","domain":"schedules","key":"last-run","value":"done"}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"success":true');
+
+    yield { type: "text", content: "Triggered run complete." };
+    yield { type: "done" };
+  }
+}
+
+class TriggeredAskTimeoutProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"ask","message":"Did you drink water?"}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"timedOut":true');
+    expect(latestToolResult?.content).toContain('"response":null');
+
+    yield { type: "text", content: "Handled timeout." };
+    yield { type: "done" };
+  }
+}
+
+class ConcurrentTriggeredAskProvider implements LLMProvider {
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    const scheduleId = extractScheduleId(messages[0]?.content ?? "");
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+
+    if (!latestToolResult) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: `ask-${scheduleId}`, name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: `ask-${scheduleId}`,
+          name: "interact",
+          arguments: JSON.stringify({
+            mode: "ask",
+            message: `Reply for ${scheduleId}.`,
+          }),
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    expect(latestToolResult.content).toContain('"success":true');
+    expect(latestToolResult.content).toContain('"response":"');
+
+    yield { type: "text", content: `Completed ${scheduleId}.` };
     yield { type: "done" };
   }
 }
@@ -632,6 +885,7 @@ describe("AgentRuntime", () => {
       expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
         mode: "ask",
         content: "Need input now.",
+        promptId: expect.any(String),
       }));
 
       const session = sessionManager.getInteractiveSession();
@@ -640,6 +894,63 @@ describe("AgentRuntime", () => {
       ]);
       expect(adapter.streamChunks).toEqual([
         { sessionId: sessionManager.getInteractiveSession()!.id, content: "Prompt round-trip complete." },
+      ]);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("only consumes replies that match the active prompt id and routes unmatched inbound messages normally", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new CorrelatedAskThenTextProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-correlated-${crypto.randomUUID()}`),
+      }),
+    });
+
+    runtime.start();
+
+    try {
+      adapter.dispatchInbound("start");
+
+      await waitForCondition(
+        () => adapter.sentMessages.some((message) => message.mode === "ask" && typeof message.promptId === "string"),
+        1000,
+        "Timed out waiting for the correlated ask prompt",
+      );
+
+      const promptMessage = adapter.sentMessages.find((message) => message.mode === "ask");
+      expect(promptMessage?.promptId).toEqual(expect.any(String));
+
+      adapter.dispatchInbound("wrong reply", new Date(), "different-prompt-id");
+
+      adapter.dispatchInbound("correct reply", new Date(), promptMessage?.promptId);
+
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.callCount).toBe(3);
+      expect(adapter.streamChunks).toEqual([
+        { sessionId: sessionManager.getInteractiveSession()!.id, content: "Prompt used the matching reply." },
+        { sessionId: sessionManager.getInteractiveSession()!.id, content: "Handled unmatched inbound message." },
+      ]);
+
+      const session = sessionManager.getInteractiveSession();
+      expect(session?.messages.filter((message) => message.role === "user").map((message) => message.content)).toEqual([
+        "start",
+        "wrong reply",
       ]);
     } finally {
       await runtime.shutdown(1000);
@@ -716,7 +1027,8 @@ describe("AgentRuntime", () => {
 
     expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
       mode: "approve",
-      content: expect.stringContaining("mockmail.messages.send"),
+      content: expect.stringMatching(/mockmail\.messages\.send.*Reply exactly yes or no only\./),
+      promptId: expect.any(String),
     }));
 
     adapter.dispatchInbound("yes");
@@ -801,6 +1113,329 @@ describe("AgentRuntime", () => {
     expect(postRequests).toBe(1);
     expect(adapter.sentMessages.filter((message) => message.mode === "approve")).toHaveLength(1);
   });
+
+  test("does not burn prompt timeout while delivery is queued", async () => {
+    const adapter = new QueuedDeliveryAdapter();
+    const provider = new DeliveryAwareTriggeredAskProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: ({ now, triggeredSchedule }) => buildTriggeredSystemPrompt(now, triggeredSchedule),
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-delivery-aware-${crypto.randomUUID()}`),
+      }),
+      scheduledUserResponseTimeoutMs: 30,
+    });
+
+    runtime.start();
+
+    try {
+      const run = runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-delivery-aware",
+        workflow: "hydration",
+        group: null,
+        trigger: { type: "once", at: "2026-03-21T10:05:00.000Z" },
+        context: { instruction: "Ask after delivery." },
+        instruction: "Ask after delivery.",
+      });
+
+      await waitForCondition(
+        () => adapter.sentMessages.some((message) => message.mode === "ask"),
+        1000,
+        "Timed out waiting for the queued ask prompt",
+      );
+
+      await Bun.sleep(60);
+      adapter.markNextPromptDelivered();
+
+      const promptMessage = adapter.sentMessages.find((message) => message.mode === "ask");
+      expect(promptMessage?.promptId).toEqual(expect.any(String));
+
+      adapter.dispatchInbound("delivered reply", new Date(), promptMessage?.promptId);
+
+      expect(await run).toBe(true);
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.callCount).toBe(2);
+      expect(adapter.streamChunks).toEqual([
+        expect.objectContaining({ content: "Prompt waited for delivery." }),
+      ]);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("runs triggered sessions with full primitive access and schedule context", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-triggered-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const provider = new TriggeredMemoryProvider();
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager: new SessionManager({
+        buildSystemPrompt: ({ now, triggeredSchedule }) => buildTriggeredSystemPrompt(now, triggeredSchedule),
+      }),
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+
+    try {
+      const success = await runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-1",
+        workflow: "hydration",
+        group: "wellness",
+        trigger: { type: "once", at: "2026-03-21T10:05:00.000Z" },
+        context: { instruction: "Remind the user to drink water." },
+        instruction: "Remind the user to drink water.",
+      });
+
+      expect(success).toBe(true);
+      expect(provider.callCount).toBe(2);
+      expect(provider.systemPrompts[0]).toContain("schedule_id: schedule-1");
+      expect(provider.systemPrompts[0]).toContain("instruction: Remind the user to drink water.");
+      expect(adapter.streamChunks).toEqual([
+        expect.objectContaining({ content: "Triggered run complete." }),
+      ]);
+
+      const memoryEntry = await dispatcher.dispatch(
+        "memory",
+        {
+          operation: "get",
+          domain: "schedules",
+          key: "last-run",
+        },
+        { sessionId: "session-check" },
+      );
+
+      expect(memoryEntry).toMatchObject({
+        success: true,
+        data: {
+          entry: {
+            value: "done",
+          },
+        },
+      });
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("returns a timeout result for triggered interact prompts", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new TriggeredAskTimeoutProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: ({ now, triggeredSchedule }) => buildTriggeredSystemPrompt(now, triggeredSchedule),
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-trigger-timeout-${crypto.randomUUID()}`),
+      }),
+      scheduledUserResponseTimeoutMs: 20,
+    });
+
+    runtime.start();
+
+    try {
+      const success = await runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-timeout",
+        workflow: "hydration",
+        group: null,
+        trigger: { type: "once", at: "2026-03-21T10:05:00.000Z" },
+        context: { instruction: "Ask whether the user drank water." },
+        instruction: "Ask whether the user drank water.",
+      });
+
+      expect(success).toBe(true);
+      expect(provider.callCount).toBe(2);
+      expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+        mode: "ask",
+        content: "Did you drink water?",
+        promptId: expect.any(String),
+      }));
+      expect(adapter.streamChunks).toEqual([
+        expect.objectContaining({ content: "Handled timeout." }),
+      ]);
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("surfaces ambiguous approval responses instead of treating them as denials", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new InteractAmbiguousApproveProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-ambiguous-approve-${crypto.randomUUID()}`),
+      }),
+    });
+
+    runtime.start();
+
+    try {
+      adapter.dispatchInbound("start");
+
+      await waitForCondition(
+        () => adapter.sentMessages.some((message) => message.mode === "approve"),
+        1000,
+        "Timed out waiting for the approval prompt",
+      );
+
+      const promptMessage = adapter.sentMessages.find((message) => message.mode === "approve");
+      expect(promptMessage?.content).toContain("Reply exactly yes or no.");
+
+      adapter.dispatchInbound("maybe", new Date(), promptMessage?.promptId);
+
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.callCount).toBe(2);
+      expect(adapter.streamChunks).toEqual([
+        expect.objectContaining({ content: "Ambiguous approval surfaced." }),
+      ]);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("serializes overlapping triggered prompts instead of failing the second session", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new ConcurrentTriggeredAskProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: ({ now, triggeredSchedule }) => buildTriggeredSystemPrompt(now, triggeredSchedule),
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-trigger-queue-${crypto.randomUUID()}`),
+      }),
+    });
+
+    runtime.start();
+
+    try {
+      const firstRun = runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-1",
+        workflow: "hydration",
+        group: null,
+        trigger: { type: "once", at: "2026-03-21T10:05:00.000Z" },
+        context: { instruction: "Prompt for the first schedule." },
+        instruction: "Prompt for the first schedule.",
+      });
+      const secondRun = runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-2",
+        workflow: "hydration",
+        group: null,
+        trigger: { type: "once", at: "2026-03-21T10:06:00.000Z" },
+        context: { instruction: "Prompt for the second schedule." },
+        instruction: "Prompt for the second schedule.",
+      });
+
+      await waitForCondition(
+        () => adapter.sentMessages.filter((message) => message.mode === "ask").length === 1,
+        1000,
+        "Timed out waiting for the first triggered prompt",
+      );
+
+      expect(adapter.sentMessages.filter((message) => message.mode === "ask")).toEqual([
+        expect.objectContaining({
+          mode: "ask",
+          content: "Reply for schedule-1.",
+        }),
+      ]);
+
+      adapter.dispatchInbound("first reply");
+
+      await waitForCondition(
+        () => adapter.sentMessages.filter((message) => message.mode === "ask").length === 2,
+        1000,
+        "Timed out waiting for the queued triggered prompt",
+      );
+
+      expect(adapter.sentMessages.filter((message) => message.mode === "ask")).toEqual([
+        expect.objectContaining({
+          mode: "ask",
+          content: "Reply for schedule-1.",
+        }),
+        expect.objectContaining({
+          mode: "ask",
+          content: "Reply for schedule-2.",
+        }),
+      ]);
+
+      adapter.dispatchInbound("second reply");
+
+      expect(await firstRun).toBe(true);
+      expect(await secondRun).toBe(true);
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(adapter.streamChunks).toEqual([
+        expect.objectContaining({ content: "Completed schedule-1." }),
+        expect.objectContaining({ content: "Completed schedule-2." }),
+      ]);
+      expect(adapter.sentMessages.some((message) => message.content.includes("Another user prompt is already waiting for a response."))).toBe(false);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
 });
 
 async function waitForCondition(
@@ -822,4 +1457,16 @@ async function writePolicy(homeDir: string, content: string): Promise<void> {
   const policyDir = join(homeDir, ".agent-policy");
   await mkdir(policyDir, { recursive: true });
   await Bun.write(join(policyDir, "policy.yaml"), content);
+}
+
+function buildTriggeredSystemPrompt(now: Date, triggeredSchedule: { schedule_id: string; instruction: string } | undefined): string {
+  return [
+    `Current time: ${now.toISOString()}`,
+    triggeredSchedule ? `schedule_id: ${triggeredSchedule.schedule_id}` : null,
+    triggeredSchedule ? `instruction: ${triggeredSchedule.instruction}` : null,
+  ].filter(Boolean).join("\n");
+}
+
+function extractScheduleId(systemPrompt: string): string {
+  return systemPrompt.match(/schedule_id: (.+)/)?.[1] ?? "unknown";
 }

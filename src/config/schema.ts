@@ -21,6 +21,9 @@ export interface RawAgentConfigFile {
     type?: string;
     port?: number;
   };
+  runtime?: {
+    timezone?: string;
+  };
 }
 
 export interface RuntimeLLMConfig {
@@ -39,6 +42,9 @@ export interface AgentConfig {
   configPath: string;
   pidPath: string;
   llm: RuntimeLLMConfig;
+  runtime: {
+    timezone: string;
+  };
   communication: {
     type: "websocket";
     port: number;
@@ -57,4 +63,7 @@ export const CONFIG_EXAMPLE = `llm:
 communication:
   type: websocket
   port: 8765
+
+runtime:
+  timezone: UTC
 `;

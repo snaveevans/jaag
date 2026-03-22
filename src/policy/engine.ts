@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { normalize, resolve } from "node:path";
 import { resolveEffectiveFilesystemTargetSync } from "../primitives/file.ts";
-import type { PrimitiveContext, InteractionHandler } from "../primitives/types.ts";
+import type { ApprovalDecision, PrimitiveContext, InteractionHandler } from "../primitives/types.ts";
 import type {
   ApprovePolicyRule,
   FilePolicyMatch,
@@ -151,17 +151,25 @@ export class PolicyEngine {
       };
     }
 
-    const approved = await interactionHandler.requestApproval(buildApprovalMessage(policyContext), context, {
+    const decision = await interactionHandler.requestApproval(buildApprovalMessage(policyContext), context, {
       tool: policyContext.primitive === "http" ? policyContext.tool : undefined,
       operation: policyContext.primitive === "http" ? policyContext.operation : undefined,
       recordReceipt: false,
       summary: describeTarget(policyContext),
     });
 
-    if (!approved) {
+    if (decision.approved === false) {
       return {
         action: "block",
         reason: `User denied: ${describeTarget(policyContext)}.`,
+        rule,
+      };
+    }
+
+    if (decision.approved !== true) {
+      return {
+        action: "block",
+        reason: describeAmbiguousApproval(policyContext, decision),
         rule,
       };
     }
@@ -226,21 +234,34 @@ function buildApprovalMessage(policyContext: PolicyEvaluationContext): string {
   switch (policyContext.primitive) {
     case "http":
       if (policyContext.tool && policyContext.operation) {
-        return `Agent wants to call ${policyContext.tool}.${policyContext.operation} via HTTP ${policyContext.method} ${policyContext.domain}${policyContext.path}. Allow? Reply yes or no.`;
+        return `Agent wants to call ${policyContext.tool}.${policyContext.operation} via HTTP ${policyContext.method} ${policyContext.domain}${policyContext.path}. Allow? Reply exactly yes or no only.`;
       }
 
-      return `Agent wants to send HTTP ${policyContext.method} request to ${policyContext.domain}${policyContext.path}. Allow? Reply yes or no.`;
+      return `Agent wants to send HTTP ${policyContext.method} request to ${policyContext.domain}${policyContext.path}. Allow? Reply exactly yes or no only.`;
     case "file_read":
-      return `Agent wants to read ${policyContext.path}. Allow? Reply yes or no.`;
+      return `Agent wants to read ${policyContext.path}. Allow? Reply exactly yes or no only.`;
     case "file_write":
-      return `Agent wants to write to ${policyContext.path}. Allow? Reply yes or no.`;
+      return `Agent wants to write to ${policyContext.path}. Allow? Reply exactly yes or no only.`;
     case "execute":
-      return `Agent wants to run shell command: ${policyContext.command}. Allow? Reply yes or no.`;
+      return `Agent wants to run shell command: ${policyContext.command}. Allow? Reply exactly yes or no only.`;
     case "schedule":
-      return `Agent wants to use schedule${policyContext.trigger_type ? ` with trigger type ${policyContext.trigger_type}` : ""}. Allow? Reply yes or no.`;
+      return `Agent wants to use schedule${policyContext.trigger_type ? ` with trigger type ${policyContext.trigger_type}` : ""}. Allow? Reply exactly yes or no only.`;
     default:
       return assertNever(policyContext);
   }
+}
+
+function describeAmbiguousApproval(policyContext: PolicyEvaluationContext, decision: ApprovalDecision): string {
+  const base = `Approval response was unrecognized for ${describeTarget(policyContext)}.`;
+  if (decision.response) {
+    return `${base} Received: ${JSON.stringify(decision.response)}. Reply exactly yes or no.`;
+  }
+
+  if (decision.error) {
+    return `${base} ${decision.error}`;
+  }
+
+  return `${base} Reply exactly yes or no.`;
 }
 
 function describeTarget(policyContext: PolicyEvaluationContext): string {
