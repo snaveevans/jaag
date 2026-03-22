@@ -110,6 +110,12 @@ export function buildSpecHttpRequest(
 }
 
 export function buildRawHttpRequest(params: Record<string, unknown>): PreparedHttpRequest {
+  for (const key of Object.keys(params)) {
+    if (key !== "url" && key !== "method" && key !== "headers" && key !== "body") {
+      throw new Error(`Unknown parameter: ${key}.`);
+    }
+  }
+
   const url = requireAbsoluteUrl(params.url);
   const method = requireMethod(params.method);
   const headers = normalizeHeaders(params.headers);
@@ -127,11 +133,17 @@ export function buildRawHttpRequest(params: Record<string, unknown>): PreparedHt
 
 function requireAbsoluteUrl(value: unknown): string {
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error("Invalid url: expected a non-empty string.");
+    throw new Error("Invalid url: expected an absolute http:// or https:// URL.");
   }
 
-  const url = new URL(value);
-  if (!url.protocol.startsWith("http")) {
+  let url: URL;
+  try {
+    url = new URL(value.trim());
+  } catch {
+    throw new Error("Invalid url: expected an absolute http:// or https:// URL.");
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("Invalid url: only http and https URLs are supported.");
   }
 

@@ -52,19 +52,19 @@ Primary scan source: `reviews/critic-review.md`.
 
 - Problem: Some helper paths still emit generic validation errors like `Invalid string...` or `Expected optional string parameter...` without naming the offending field.
 - Why it matters: The model has to guess which argument to repair, which causes avoidable retry turns.
-- Suggested follow-up: Thread field names through shared optional-string and repair helpers so all runtime validation messages point to the bad parameter explicitly.
+- Status after 2026-03-22 pass: Fixed for the known schedule and dispatcher helper paths in `src/primitives/schedule.ts` and `src/primitives/dispatcher.ts`. Remaining residue, if any, should be tracked only when another concrete generic repair path is observed.
 - Key refs: `src/primitives/schedule.ts`, `src/primitives/dispatcher.ts`
 
 ### P2 - Stop treating missing schedule mutations as `success: true`
 
 - Problem: `schedule.update` and `schedule.delete` return `success: true` even when no target schedule exists.
 - Why it matters: Tool-using models often overweight the top-level success bit and may conclude the mutation worked when it did not.
-- Suggested follow-up: Return `success: false` for not-found mutations, or at minimum add explicit not-found semantics that the model can key off reliably.
+- Status after 2026-03-22 pass: Fixed. `schedule.update` and not-found `schedule.delete` paths now return `success: false` with explicit not-found errors plus `deleted: false`/`schedule: null` payloads where relevant.
 - Key refs: `src/primitives/schedule.ts`, `reviews/critic-review.md`
 
 ### P2 - Tighten the provider-facing raw `http` declaration and audit remaining primitive/runtime drift
 
-- Problem: The raw `http` primitive is intentionally broad (`additionalProperties: true`, free-form method and body), while other primitives are stricter and `schedule` already demonstrates how declaration/runtime drift wastes turns.
-- Why it matters: Broad or inconsistent declarations increase provider variance, make tool selection noisier, and leave too much repair work to runtime errors.
-- Suggested follow-up: Audit primitive declarations against runtime validation, starting with raw HTTP; tighten schemas where safe and document when raw HTTP is a last-resort escape hatch instead of the preferred path.
+- Problem: The remaining raw `http` drift was that the declaration rejected unknown top-level fields, but runtime still ignored them; `method` and `body` otherwise remain intentionally broad.
+- Why it matters: Schema/runtime drift makes repair behavior inconsistent and wastes turns even when the provider-facing declaration is already stricter.
+- Status after 2026-03-22 pass: Fixed. Raw `http` runtime now rejects unknown top-level params to match the tightened declaration. Remaining residue is the broader primitive/runtime drift audit outside raw HTTP.
 - Key refs: `src/primitives/types.ts`, `src/interpreter/request-builder.ts`, `src/primitives/dispatcher.ts`, `src/primitives/schedule.ts`

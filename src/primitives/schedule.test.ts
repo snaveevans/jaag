@@ -189,6 +189,119 @@ describe("schedule primitive", () => {
     });
   });
 
+  test("returns field-named repair errors for schedule inputs", async () => {
+    const { dispatcher } = await createHarness();
+
+    const invalidGroup = await dispatcher.dispatch(
+      "schedule",
+      {
+        operation: "delete",
+        group: "   ",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(invalidGroup).toEqual({
+      success: false,
+      error: "Invalid group: expected a non-empty string.",
+    });
+
+    const invalidNestedInstruction = await dispatcher.dispatch(
+      "schedule",
+      {
+        operation: "create",
+        workflow: "hydration",
+        context: {
+          instruction: "   ",
+        },
+        trigger: {
+          type: "once",
+          at: "2026-03-21T10:30:00.000Z",
+        },
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(invalidNestedInstruction).toEqual({
+      success: false,
+      error: "Invalid context.instruction: expected a non-empty string.",
+    });
+
+    const invalidFilterGroup = await dispatcher.dispatch(
+      "schedule",
+      {
+        operation: "list",
+        filters: {
+          group: "   ",
+        },
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(invalidFilterGroup).toEqual({
+      success: false,
+      error: "Invalid filters.group: expected a non-empty string.",
+    });
+  });
+
+  test("returns success false when schedule update or delete targets are missing", async () => {
+    const { dispatcher } = await createHarness();
+
+    const missingUpdate = await dispatcher.dispatch(
+      "schedule",
+      {
+        operation: "update",
+        schedule_id: "missing-schedule",
+        instruction: "Try to update a missing schedule.",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(missingUpdate).toMatchObject({
+      success: false,
+      error: "Schedule not found: missing-schedule.",
+      data: {
+        schedule: null,
+      },
+    });
+
+    const missingDeleteById = await dispatcher.dispatch(
+      "schedule",
+      {
+        operation: "delete",
+        schedule_id: "missing-schedule",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(missingDeleteById).toMatchObject({
+      success: false,
+      error: "Schedule not found: missing-schedule.",
+      data: {
+        deleted: false,
+        count: 0,
+      },
+    });
+
+    const missingDeleteByGroup = await dispatcher.dispatch(
+      "schedule",
+      {
+        operation: "delete",
+        group: "missing-group",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(missingDeleteByGroup).toMatchObject({
+      success: false,
+      error: "No schedules found for group: missing-group.",
+      data: {
+        deleted: false,
+        count: 0,
+      },
+    });
+  });
+
   test("rejects event schedules with a clear error", async () => {
     const { dispatcher } = await createHarness();
 

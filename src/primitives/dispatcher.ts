@@ -294,8 +294,8 @@ function createInteractHandler(getInteractionHandler: () => InteractionHandler |
         }
         case "approve": {
           const decision = await interactionHandler.requestApproval(message, context, {
-            tool: optionalStringParam(params.tool),
-            operation: optionalStringParam(params.operation),
+            tool: optionalStringParam(params.tool, "tool"),
+            operation: optionalStringParam(params.operation, "operation"),
             summary: message,
             recordReceipt: true,
           });
@@ -312,7 +312,7 @@ function createInteractHandler(getInteractionHandler: () => InteractionHandler |
       }
     } catch (error) {
       if (context.triggerSource === "schedule" && error instanceof InteractionTimeoutError) {
-        const mode = optionalStringParam(params.mode);
+        const mode = optionalStringParam(params.mode, "mode");
         if (mode === "approve") {
           return {
             success: true,
@@ -393,7 +393,7 @@ async function buildPrimitivePolicyContext(
 }
 
 function extractScheduleTriggerType(params: Record<string, unknown>): string | undefined {
-  const directType = optionalStringParam(params.trigger_type);
+  const directType = optionalStringParam(params.trigger_type, "trigger_type");
   if (directType) {
     return directType;
   }
@@ -403,7 +403,7 @@ function extractScheduleTriggerType(params: Record<string, unknown>): string | u
     return undefined;
   }
 
-  return optionalStringParam((rawTrigger as Record<string, unknown>).type);
+  return optionalStringParam((rawTrigger as Record<string, unknown>).type, "trigger.type");
 }
 
 function buildOperationPolicyContext(
@@ -442,13 +442,13 @@ function requireStringParam(value: unknown, fieldName: string): string {
   return value.trim();
 }
 
-function optionalStringParam(value: unknown): string | undefined {
+function optionalStringParam(value: unknown, fieldName: string): string | undefined {
   if (value === undefined) {
     return undefined;
   }
 
   if (typeof value !== "string" || value.trim() === "") {
-    throw new Error("Expected optional string parameter to be a non-empty string.");
+    throw new Error(`Invalid ${fieldName}: expected a non-empty string.`);
   }
 
   return value.trim();

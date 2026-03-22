@@ -61,17 +61,30 @@ const SCHEDULE_FILTER_TRIGGER_TYPE_ENUM = ["cron", "once", "event"];
 export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
   {
     name: "http",
-    description: "Perform a raw HTTP request when no higher-level tool exists.",
+    description: "Perform a raw HTTP request as an escape hatch when no higher-level tool exists.",
     parameters: {
       type: "object",
       properties: {
-        url: { type: "string", description: "Absolute request URL." },
-        method: { type: "string", description: "HTTP method such as GET or POST." },
-        headers: { type: "object", description: "Optional request headers." },
+        url: {
+          type: "string",
+          minLength: 1,
+          pattern: "^https?://",
+          description: "Absolute request URL starting with http:// or https://.",
+        },
+        method: {
+          type: "string",
+          minLength: 1,
+          description: "HTTP method such as GET, POST, PUT, PATCH, or DELETE.",
+        },
+        headers: {
+          type: "object",
+          description: "Optional request headers as an object of string values.",
+          additionalProperties: { type: "string" },
+        },
         body: { description: "Optional request body." },
       },
       required: ["url", "method"],
-      additionalProperties: true,
+      additionalProperties: false,
     },
   },
   {

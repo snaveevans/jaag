@@ -2,6 +2,42 @@ import { describe, expect, test } from "bun:test";
 import { RAW_PRIMITIVE_DECLARATIONS } from "./types.ts";
 
 describe("primitive tool schemas", () => {
+  test("http declaration aligns with raw request validation while keeping body broad", () => {
+    const parameters = getPrimitiveParameters("http");
+
+    expect(parameters).toMatchObject({
+      type: "object",
+      required: ["url", "method"],
+      additionalProperties: false,
+    });
+
+    const properties = getSchemaProperties(parameters);
+    expect(properties.url).toMatchObject({
+      type: "string",
+      minLength: 1,
+      pattern: "^https?://",
+    });
+    expect(String((properties.url as { description?: string }).description)).toContain("http:// or https://");
+
+    expect(properties.method).toMatchObject({
+      type: "string",
+      minLength: 1,
+    });
+    expect(String((properties.method as { description?: string }).description)).toContain("GET");
+
+    expect(properties.headers).toMatchObject({
+      type: "object",
+      additionalProperties: {
+        type: "string",
+      },
+    });
+
+    expect(properties.body).toMatchObject({
+      description: expect.stringContaining("Optional request body"),
+    });
+    expect((properties.body as { type?: unknown }).type).toBeUndefined();
+  });
+
   test("schedule declaration exposes the schedule handler contract", () => {
     const parameters = getPrimitiveParameters("schedule");
 

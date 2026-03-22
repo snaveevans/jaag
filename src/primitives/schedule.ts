@@ -82,7 +82,8 @@ function handleUpdate(store: ScheduleStore, params: Record<string, unknown>): Pr
   const current = store.getById(scheduleId);
   if (!current) {
     return {
-      success: true,
+      success: false,
+      error: `Schedule not found: ${scheduleId}.`,
       data: { schedule: null },
     };
   }
@@ -101,7 +102,7 @@ function handleUpdate(store: ScheduleStore, params: Record<string, unknown>): Pr
 
 function handleDelete(store: ScheduleStore, params: Record<string, unknown>): PrimitiveResult {
   const scheduleId = optionalScheduleId(params);
-  const group = optionalNullableString(params.group);
+  const group = optionalNullableString(params.group, "group");
 
   if (scheduleId && group !== undefined) {
     throw new Error("Schedule delete accepts either schedule_id/id or group, not both.");
@@ -109,10 +110,21 @@ function handleDelete(store: ScheduleStore, params: Record<string, unknown>): Pr
 
   if (scheduleId) {
     const count = store.deleteById(scheduleId);
+    if (count === 0) {
+      return {
+        success: false,
+        error: `Schedule not found: ${scheduleId}.`,
+        data: {
+          deleted: false,
+          count,
+        },
+      };
+    }
+
     return {
       success: true,
       data: {
-        deleted: count > 0,
+        deleted: true,
         count,
       },
     };
@@ -123,10 +135,21 @@ function handleDelete(store: ScheduleStore, params: Record<string, unknown>): Pr
   }
 
   const count = store.deleteByGroup(group);
+  if (count === 0) {
+    return {
+      success: false,
+      error: `No schedules found for group: ${group}.`,
+      data: {
+        deleted: false,
+        count,
+      },
+    };
+  }
+
   return {
     success: true,
     data: {
-      deleted: count > 0,
+      deleted: true,
       count,
     },
   };
@@ -135,7 +158,7 @@ function handleDelete(store: ScheduleStore, params: Record<string, unknown>): Pr
 function parseCreateInput(params: Record<string, unknown>): CreateScheduleInput {
   return {
     workflow: requireString(params.workflow, "workflow"),
-    group: optionalNullableString(params.group),
+    group: optionalNullableString(params.group, "group"),
     trigger: parseTrigger(params.trigger),
     context: normalizeContext(params),
     status: optionalScheduleStatus(params.status),
@@ -153,7 +176,7 @@ function parseUpdateInput(
   }
 
   if (params.group !== undefined) {
-    updates.group = optionalNullableString(params.group) ?? null;
+    updates.group = optionalNullableString(params.group, "group") ?? null;
   }
 
   if (params.trigger !== undefined) {
@@ -176,8 +199,8 @@ function parseListFilters(params: Record<string, unknown>): ScheduleListFilters 
   const filters = rawFilters === undefined ? {} : requireRecord(rawFilters, "filters");
 
   return {
-    workflow: optionalString(params.workflow) ?? optionalString(filters.workflow),
-    group: optionalString(params.group) ?? optionalString(filters.group),
+    workflow: optionalString(params.workflow, "workflow") ?? optionalString(filters.workflow, "filters.workflow"),
+    group: optionalString(params.group, "group") ?? optionalString(filters.group, "filters.group"),
     status: optionalScheduleStatus(params.status) ?? optionalScheduleStatus(filters.status),
     trigger_type: optionalScheduleTriggerType(params.trigger_type) ?? optionalScheduleTriggerType(filters.trigger_type),
   };
@@ -188,8 +211,8 @@ function normalizeContext(
   existingContext?: ScheduleContextPayload,
 ): ScheduleContextPayload {
   const rawContext = params.context === undefined ? {} : requireRecord(params.context, "context");
-  const instruction = optionalString(params.instruction)
-    ?? optionalString(rawContext.instruction)
+  const instruction = optionalString(params.instruction, "instruction")
+    ?? optionalString(rawContext.instruction, "context.instruction")
     ?? existingContext?.instruction
     ?? null;
 
@@ -214,7 +237,7 @@ function parseTrigger(value: unknown): ScheduleTrigger {
       type: "cron",
       expression,
       cron: expression,
-      description: optionalString(trigger.description),
+      description: optionalString(trigger.description, "trigger.description"),
     };
   }
 
@@ -222,7 +245,7 @@ function parseTrigger(value: unknown): ScheduleTrigger {
     return {
       type: "once",
       at: requireString(trigger.at, "trigger.at"),
-      description: optionalString(trigger.description),
+      description: optionalString(trigger.description, "trigger.description"),
     };
   }
 
@@ -236,7 +259,7 @@ function requireScheduleId(params: Record<string, unknown>): string {
 }
 
 function optionalScheduleId(params: Record<string, unknown>): string | undefined {
-  return optionalString(params.schedule_id) ?? optionalString(params.id);
+  return optionalString(params.schedule_id, "schedule_id") ?? optionalString(params.id, "id");
 }
 
 function requireRecord(value: unknown, fieldName: string): Record<string, unknown> {
@@ -255,15 +278,15 @@ function requireString(value: unknown, fieldName: string): string {
   return value.trim();
 }
 
-function optionalString(value: unknown): string | undefined {
+function optionalString(value: unknown, fieldName: string): string | undefined {
   if (value === undefined || value === null) {
     return undefined;
   }
 
-  return requireString(value, "string");
+  return requireString(value, fieldName);
 }
 
-function optionalNullableString(value: unknown): string | null | undefined {
+function optionalNullableString(value: unknown, fieldName: string): string | null | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -272,7 +295,7 @@ function optionalNullableString(value: unknown): string | null | undefined {
     return null;
   }
 
-  return requireString(value, "string");
+  return requireString(value, fieldName);
 }
 
 function optionalScheduleStatus(value: unknown): ScheduleStatus | undefined {

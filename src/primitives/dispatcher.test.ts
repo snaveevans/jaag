@@ -192,6 +192,20 @@ describe("PrimitiveDispatcher", () => {
         },
       });
 
+      const invalidRawHttpResult = await dispatcher.dispatch(
+        "http",
+        {
+          url: `http://127.0.0.1:${server.port}/raw`,
+          method: "GET",
+          extra: 123,
+        },
+        { sessionId: "session-1" },
+      );
+      expect(invalidRawHttpResult).toMatchObject({
+        success: false,
+        error: "Unknown parameter: extra.",
+      });
+
       const toolResult = await dispatcher.dispatch(
         "mockapi.items.list",
         {
@@ -251,5 +265,42 @@ describe("PrimitiveDispatcher", () => {
       error: expect.stringContaining("Policy blocked"),
     });
     expect(await Bun.file(join(outsideDir, "leak.txt")).exists()).toBe(false);
+  });
+
+  test("returns field-named repair errors for optional interact parameters", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-dispatcher-interact-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+    });
+
+    dispatcher.setInteractionHandler({
+      notify: async () => ({ delivered: true }),
+      ask: async () => "ack",
+      requestApproval: async () => ({ approved: true, response: "yes" }),
+      hasApprovalReceipt: () => false,
+    });
+
+    const result = await dispatcher.dispatch(
+      "interact",
+      {
+        mode: "approve",
+        message: "Approve the action?",
+        tool: "   ",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "Invalid tool: expected a non-empty string.",
+    });
   });
 });
