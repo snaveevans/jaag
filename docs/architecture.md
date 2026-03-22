@@ -27,6 +27,8 @@ Current frameworks (LangChain, Semantic Kernel, CrewAI, etc.) encode all three i
 
 ## The 7 Primitives
 
+> **Current status:** This overview describes the target primitive model. In the current runtime, `schedule` is currently shipped for time-based triggers (`once`/`cron`), while event-based scheduling and the `execute` primitive are still planned follow-up work.
+
 ### 1. `http` — Network Communication
 
 **What it does:** Makes HTTP requests to any URL. GET, POST, PUT, DELETE, PATCH. Handles headers, query parameters, request bodies, and response parsing.

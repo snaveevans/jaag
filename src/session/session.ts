@@ -66,6 +66,12 @@ export class AgentSession {
     this.touch(at);
   }
 
+  appendSystemMessage(content: string, at = new Date()): void {
+    this.messages.push({ role: "system", content });
+    this.status = "active";
+    this.touch(at);
+  }
+
   appendToolResult(toolResultId: string, content: string, at = new Date()): void {
     this.messages.push({
       role: "tool_result",

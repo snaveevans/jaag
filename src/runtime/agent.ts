@@ -18,6 +18,7 @@ import type { AgentSession } from "../session/session.ts";
 
 const USER_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const SCHEDULED_USER_RESPONSE_TIMEOUT_MS = 2 * 60 * 1000;
+const SPEC_REGISTER_FRESHNESS_NOTE = "Installed-tool guidance may now be stale after spec.register succeeded. Use spec.list to refresh the current manifest before using newly registered tools.";
 
 interface UserResponseRequest {
   promptId: string;
@@ -229,6 +230,7 @@ export class AgentRuntime {
       if (toolCalls.length > 0) {
         session.appendAssistantMessage(assistantText, toolCalls);
 
+        let shouldAppendFreshnessNote = false;
         for (const toolCall of toolCalls) {
           session.incrementIteration();
           if (session.hasReachedIterationLimit()) {
@@ -243,6 +245,13 @@ export class AgentRuntime {
 
           const toolResult = await this.dispatchToolCall(session, toolCall);
           session.appendToolResult(toolCall.id, JSON.stringify(toolResult));
+          if (shouldAppendSpecRegisterFreshnessNote(toolCall.name, toolResult)) {
+            shouldAppendFreshnessNote = true;
+          }
+        }
+
+        if (shouldAppendFreshnessNote) {
+          session.appendSystemMessage(SPEC_REGISTER_FRESHNESS_NOTE);
         }
 
         continue;
@@ -645,6 +654,10 @@ function toErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function shouldAppendSpecRegisterFreshnessNote(toolName: string, toolResult: unknown): boolean {
+  return toolName === "spec.register" && toolResult !== null && typeof toolResult === "object" && (toolResult as { success?: unknown }).success === true;
 }
 
 function parseApprovalResponse(content: string): ApprovalDecision {

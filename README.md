@@ -13,9 +13,9 @@ Most "agent frameworks" operate at the wrong abstraction layer. Define a minimal
 | `http` | Network communication (REST/GraphQL API calls) |
 | `file_read` | Read files and directories (read-only, safe) |
 | `file_write` | Create and modify files (destructive, separated from read for security) |
-| `execute` | Run shell commands in a sandboxed environment |
+| `execute` | Planned for Slice 06 (not yet implemented) |
 | `memory` | Persistent knowledge store (SQLite + FTS5, keyed + fuzzy search) |
-| `schedule` | Time and event-based triggers (cron, one-shot, event-based) |
+| `schedule` | Time-based triggers (`cron` and `once` shipped; `event` deferred) |
 | `interact` | Human communication (notify, ask, approve modes) |
 
 ## Tech Stack
@@ -81,14 +81,16 @@ bun run start
 | `bun run dev` | Start with file watching (auto-restart on changes) |
 | `bun run test` | Run all tests |
 | `bun run typecheck` | TypeScript type checking |
-| `bun run manual:ws "prompt"` | Manual WebSocket client for testing |
+| `bun run manual:ws "prompt"` | Manual WebSocket client for testing, including follow-up stdin replies |
 
 ### Manual client options
 
 The manual WebSocket client (`bun run manual:ws`) accepts environment variables:
 
 - `AGENT_WS_URL` -- WebSocket URL (default: `ws://127.0.0.1:8765`)
-- `AGENT_WS_IDLE_MS` -- Idle timeout in ms before auto-close (default: `1500`, `0` to disable)
+- `AGENT_WS_IDLE_MS` -- Idle timeout in ms before auto-close (default: `1500`; set `0` for a persistent manual debugging session)
+
+After the initial prompt, you can answer runtime `ask` / `approve` prompts directly over stdin. For longer manual sessions, `AGENT_WS_IDLE_MS=0 bun run manual:ws "prompt"` keeps the client open until you exit.
 
 ## Project Structure
 
@@ -118,25 +120,28 @@ docs/
 
 ## Current Status
 
-**Slice 01 (Skeleton)** is complete:
+Slices **01-05 are shipped**:
 
-- YAML config loading with validation
-- WebSocket server for client communication
-- Streaming LLM responses from OpenAI-compatible APIs
-- Session management with inactivity timeout and iteration limits
-- ReAct tool-call loop (primitives are stubbed)
-- PID file management (prevents duplicate daemons)
-- Graceful shutdown on SIGINT/SIGTERM
+- Slice 01: daemon skeleton, config loading, streaming LLM loop, session management, PID handling, graceful shutdown
+- Slice 02: `memory`, `file_read`, and `file_write`
+- Slice 03: declarative tool specs, `spec.*` system tools, HTTP-backed operation execution, auth flows
+- Slice 04: policy enforcement and approval gating
+- Slice 05: scheduling with `cron` and `once` triggers plus triggered-session execution
+
+Still deferred / planned:
+
+- `schedule` `event` triggers are deferred
+- `execute` remains planned for Slice 06 and is not implemented yet
 
 ### Roadmap
 
 | Slice | Name | Status |
 |-------|------|--------|
-| 01 | Skeleton | Done |
-| 02 | Memory & File Primitives | Planned |
-| 03 | Tool Spec Interpreter & HTTP | Planned |
-| 04 | Policy Enforcement | Planned |
-| 05 | Scheduling | Planned |
+| 01 | Skeleton | Shipped |
+| 02 | Memory & File Primitives | Shipped |
+| 03 | Tool Spec Interpreter & HTTP | Shipped |
+| 04 | Policy Enforcement | Shipped |
+| 05 | Scheduling | Shipped (`cron` / `once`; `event` deferred) |
 | 06 | Execute Primitive | Planned |
 | 07 | Hardening | Planned |
 

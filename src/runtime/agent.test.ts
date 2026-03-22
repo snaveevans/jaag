@@ -204,6 +204,86 @@ class ToolRecordingProvider implements LLMProvider {
   }
 }
 
+class RegisterThenCheckFreshnessProvider implements LLMProvider {
+  callCount = 0;
+  messageSnapshots: InternalMessage[][] = [];
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+    this.messageSnapshots.push(messages.map((message) => ({ ...message })));
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "spec.register", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "spec.register",
+          arguments: JSON.stringify({ spec: buildMockBearerToolSpec("https://example.test") }),
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    yield { type: "text", content: "Freshness note observed." };
+    yield { type: "done" };
+  }
+}
+
+class RegisterTwiceThenCheckFreshnessProvider implements LLMProvider {
+  callCount = 0;
+  messageSnapshots: InternalMessage[][] = [];
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+    this.messageSnapshots.push(messages.map((message) => ({ ...message })));
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "spec.register", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "spec.register",
+          arguments: JSON.stringify({ spec: buildMockBearerToolSpec("https://example.test") }),
+        },
+      };
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-2", name: "spec.register", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-2",
+          name: "spec.register",
+          arguments: JSON.stringify({ spec: buildMockOAuthToolSpec("https://oauth.example.test") }),
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    yield { type: "text", content: "Single freshness note observed." };
+    yield { type: "done" };
+  }
+}
+
 class OAuthToolThenTextProvider implements LLMProvider {
   callCount = 0;
 
@@ -725,6 +805,87 @@ describe("AgentRuntime", () => {
     expect(await runtime.waitForIdle(1000)).toBe(true);
     expect(provider.toolNames).toContain("spec.list");
     expect(provider.toolNames).toContain("mockapi.items.list");
+  });
+
+  test("injects a freshness note after successful spec.register before the next model turn", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new RegisterThenCheckFreshnessProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-register-note-${crypto.randomUUID()}`),
+        seedTrustedSpecs: false,
+      }),
+    });
+
+    runtime.start();
+    adapter.dispatchInbound("install the tool");
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.callCount).toBe(2);
+
+    const secondTurnMessages = provider.messageSnapshots[1] ?? [];
+    const toolResultIndex = secondTurnMessages.findIndex((message) => message.role === "tool_result" && message.toolResultId === "call-1");
+    const freshnessNoteIndex = secondTurnMessages.findIndex((message) => message.role === "system" && message.content.includes("Installed-tool guidance may now be stale after spec.register succeeded."));
+
+    expect(toolResultIndex).toBeGreaterThanOrEqual(0);
+    expect(freshnessNoteIndex).toBe(toolResultIndex + 1);
+    expect(secondTurnMessages[freshnessNoteIndex]?.content).toContain("Use spec.list to refresh the current manifest");
+
+    const session = sessionManager.getInteractiveSession();
+    expect(session?.messages[toolResultIndex + 1]).toMatchObject({
+      role: "system",
+      content: expect.stringContaining("Installed-tool guidance may now be stale after spec.register succeeded."),
+    });
+  });
+
+  test("appends the freshness note at most once when multiple spec.register calls succeed in one assistant turn", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new RegisterTwiceThenCheckFreshnessProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-register-note-${crypto.randomUUID()}`),
+        seedTrustedSpecs: false,
+      }),
+    });
+
+    runtime.start();
+    adapter.dispatchInbound("install both tools");
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.callCount).toBe(2);
+
+    const secondTurnMessages = provider.messageSnapshots[1] ?? [];
+    const freshnessNotes = secondTurnMessages.filter(
+      (message) => message.role === "system" && message.content.includes("Installed-tool guidance may now be stale after spec.register succeeded."),
+    );
+
+    expect(freshnessNotes).toHaveLength(1);
   });
 
   test("uses the adapter to collect an OAuth authorization code and resumes the active session", async () => {
