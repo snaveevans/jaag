@@ -36,6 +36,31 @@ describe("AgentSession", () => {
     expect(session.isExpired(new Date("2026-03-19T00:00:00.999Z"))).toBe(false);
     expect(session.isExpired(new Date("2026-03-19T00:00:01.500Z"))).toBe(true);
   });
+
+  test("stores approval receipts scoped to tool and operation", () => {
+    const session = new AgentSession({
+      systemPrompt: "system prompt",
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+
+    session.addApprovalReceipt({
+      timestamp: new Date("2026-03-19T00:01:00.000Z"),
+      tool: "mockmail",
+      operation: "messages.send",
+      summary: "Send the message",
+    });
+
+    expect(session.hasApprovalReceipt({
+      tool: "mockmail",
+      operation: "messages.send",
+      now: new Date("2026-03-19T00:05:00.000Z"),
+    })).toBe(true);
+    expect(session.hasApprovalReceipt({
+      tool: "mockmail",
+      operation: "messages.delete",
+      now: new Date("2026-03-19T00:05:00.000Z"),
+    })).toBe(false);
+  });
 });
 
 describe("SessionManager", () => {

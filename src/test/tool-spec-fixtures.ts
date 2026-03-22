@@ -129,6 +129,60 @@ export function buildMockOAuthToolSpec(baseUrl: string): ToolSpec {
   };
 }
 
+export function buildMockMutationToolSpec(baseUrl: string): ToolSpec {
+  return {
+    spec_version: "0.1",
+    tool: "mockmail",
+    name: "Mock Mail",
+    description: "Mock mutation API for approval-flow tests.",
+    auth: {
+      type: "none",
+      description: "No auth required for tests.",
+    },
+    connection: {
+      base_url: baseUrl,
+      default_headers: {
+        Accept: "application/json",
+      },
+    },
+    resources: {
+      messages: {
+        description: "Mock message resource.",
+        operations: {
+          send: {
+            description: "Send a mock message.",
+            when_to_use: "Use when you need to test a mutating HTTP operation.",
+            primitive: "http",
+            method: "POST",
+            path: "/messages",
+            body: {
+              content_type: "application/json",
+              fields: {
+                subject: {
+                  type: "string",
+                  required: true,
+                  description: "Message subject.",
+                },
+                body: {
+                  type: "string",
+                  required: true,
+                  description: "Message body.",
+                },
+              },
+            },
+            response: {
+              description: "Sent message payload.",
+              important_fields: {
+                id: "string - sent message id.",
+              },
+            },
+          },
+        },
+      },
+    },
+  };
+}
+
 export function buildInvalidToolSpec(): Record<string, unknown> {
   return {
     spec_version: "0.1",

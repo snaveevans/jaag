@@ -7,7 +7,7 @@ import type { LLMProvider } from "../llm/provider.ts";
 import type { InternalMessage, ModelConfig, StreamChunk, ToolDeclaration } from "../llm/types.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
 import { SessionManager } from "../session/manager.ts";
-import { buildMockBearerToolSpec, buildMockOAuthToolSpec } from "../test/tool-spec-fixtures.ts";
+import { buildMockBearerToolSpec, buildMockMutationToolSpec, buildMockOAuthToolSpec } from "../test/tool-spec-fixtures.ts";
 import { AgentRuntime } from "./agent.ts";
 
 const servers: Bun.Server<unknown>[] = [];
@@ -51,6 +51,24 @@ class FakeAdapter implements CommunicationAdapter {
 
   dispatchInbound(content: string, timestamp = new Date()): void {
     this.handler?.({ content, timestamp });
+  }
+}
+
+class PromptReplyingAdapter extends FakeAdapter {
+  private replied = false;
+
+  constructor(private readonly reply: string) {
+    super();
+  }
+
+  override async send(message: OutboundMessage): Promise<DeliveryResult> {
+    this.sentMessages.push(message);
+    if (!this.replied && (message.mode === "ask" || message.mode === "approve")) {
+      this.replied = true;
+      this.dispatchInbound(this.reply);
+    }
+
+    return { delivered: true };
   }
 }
 
@@ -185,6 +203,116 @@ class OAuthToolThenTextProvider implements LLMProvider {
     expect(latestToolResult?.content).toContain('"success":true');
 
     yield { type: "text", content: "Authorized fetch complete." };
+    yield { type: "done" };
+  }
+}
+
+class MutationThenTextProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    _messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "mockmail.messages.send", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: { id: "call-1", name: "mockmail.messages.send", arguments: '{"subject":"Hello","body":"World"}' },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    yield { type: "text", content: "Sent after approval." };
+    yield { type: "done" };
+  }
+}
+
+class InteractApproveThenMutationProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"approve","message":"Send the drafted message? Reply yes or no.","tool":"mockmail","operation":"messages.send"}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    if (this.callCount === 2) {
+      const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+      expect(latestToolResult?.content).toContain('"approved":true');
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-2", name: "mockmail.messages.send", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: { id: "call-2", name: "mockmail.messages.send", arguments: '{"subject":"Hello","body":"World"}' },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    yield { type: "text", content: "Sent with cached approval." };
+    yield { type: "done" };
+  }
+}
+
+class InteractAskThenTextProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"ask","message":"Need input now."}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"response":"instant reply"');
+
+    yield { type: "text", content: "Prompt round-trip complete." };
     yield { type: "done" };
   }
 }
@@ -471,6 +599,208 @@ describe("AgentRuntime", () => {
       },
     });
   });
+
+  test("captures prompt replies that arrive during adapter.send", async () => {
+    const adapter = new PromptReplyingAdapter("instant reply");
+    const provider = new InteractAskThenTextProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-prompt-${crypto.randomUUID()}`),
+      }),
+    });
+
+    runtime.start();
+
+    try {
+      adapter.dispatchInbound("start");
+
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.callCount).toBe(2);
+      expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+        mode: "ask",
+        content: "Need input now.",
+      }));
+
+      const session = sessionManager.getInteractiveSession();
+      expect(session?.messages.filter((message) => message.role === "user").map((message) => message.content)).toEqual([
+        "start",
+      ]);
+      expect(adapter.streamChunks).toEqual([
+        { sessionId: sessionManager.getInteractiveSession()!.id, content: "Prompt round-trip complete." },
+      ]);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("sends a runtime approval prompt before a policy-gated HTTP mutation", async () => {
+    let postRequests = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        const pathname = new URL(request.url).pathname;
+        if (pathname === "/messages") {
+          postRequests += 1;
+          expect(request.method).toBe("POST");
+          return Response.json({ id: "msg-1", ignored: true });
+        }
+
+        return new Response("missing", { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-policy-approve-"));
+    tempDirs.push(rootDir);
+
+    const homeDir = join(rootDir, "home");
+    const agentHome = join(homeDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+    await writePolicy(homeDir, `rules:\n  - primitive: http\n    match: { method: [POST] }\n    action: approve\n    model_approval_sufficient: false\n  - primitive: http\n    action: allow\n  - primitive: file_write\n    match: { path: "~/.agent/workspace/**" }\n    action: allow\n  - primitive: file_write\n    action: block\n  - primitive: file_read\n    action: allow\n`);
+
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+      seedTrustedSpecs: false,
+    });
+    const registerResult = await dispatcher.dispatch(
+      "spec.register",
+      {
+        spec: buildMockMutationToolSpec(`http://127.0.0.1:${server.port}`),
+      },
+      { sessionId: "seed-session" },
+    );
+    expect(registerResult.success).toBe(true);
+
+    const adapter = new FakeAdapter();
+    const provider = new MutationThenTextProvider();
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager: new SessionManager({
+        buildSystemPrompt: () => "system prompt",
+      }),
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound("send the message");
+
+    await waitForCondition(
+      () => adapter.sentMessages.some((message) => message.mode === "approve"),
+      1000,
+      "Timed out waiting for the policy approval prompt",
+    );
+
+    expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+      mode: "approve",
+      content: expect.stringContaining("mockmail.messages.send"),
+    }));
+
+    adapter.dispatchInbound("yes");
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.callCount).toBe(2);
+    expect(postRequests).toBe(1);
+  });
+
+  test("reuses interact approval receipts for matching policy-gated mutations", async () => {
+    let postRequests = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        const pathname = new URL(request.url).pathname;
+        if (pathname === "/messages") {
+          postRequests += 1;
+          expect(request.method).toBe("POST");
+          return Response.json({ id: "msg-2", ignored: true });
+        }
+
+        return new Response("missing", { status: 404 });
+      },
+    });
+    servers.push(server);
+
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-policy-receipt-"));
+    tempDirs.push(rootDir);
+
+    const homeDir = join(rootDir, "home");
+    const agentHome = join(homeDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+    await writePolicy(homeDir, `rules:\n  - primitive: http\n    match: { method: [POST] }\n    action: approve\n    model_approval_sufficient: true\n  - primitive: http\n    action: allow\n  - primitive: file_write\n    match: { path: "~/.agent/workspace/**" }\n    action: allow\n  - primitive: file_write\n    action: block\n  - primitive: file_read\n    action: allow\n`);
+
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+      seedTrustedSpecs: false,
+    });
+    const registerResult = await dispatcher.dispatch(
+      "spec.register",
+      {
+        spec: buildMockMutationToolSpec(`http://127.0.0.1:${server.port}`),
+      },
+      { sessionId: "seed-session" },
+    );
+    expect(registerResult.success).toBe(true);
+
+    const adapter = new FakeAdapter();
+    const provider = new InteractApproveThenMutationProvider();
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager: new SessionManager({
+        buildSystemPrompt: () => "system prompt",
+      }),
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound("send the drafted message");
+
+    await waitForCondition(
+      () => adapter.sentMessages.some((message) => message.mode === "approve"),
+      1000,
+      "Timed out waiting for the interact approval prompt",
+    );
+
+    adapter.dispatchInbound("yes");
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.callCount).toBe(3);
+    expect(postRequests).toBe(1);
+    expect(adapter.sentMessages.filter((message) => message.mode === "approve")).toHaveLength(1);
+  });
 });
 
 async function waitForCondition(
@@ -486,4 +816,10 @@ async function waitForCondition(
 
     await Bun.sleep(10);
   }
+}
+
+async function writePolicy(homeDir: string, content: string): Promise<void> {
+  const policyDir = join(homeDir, ".agent-policy");
+  await mkdir(policyDir, { recursive: true });
+  await Bun.write(join(policyDir, "policy.yaml"), content);
 }

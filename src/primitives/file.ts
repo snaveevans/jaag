@@ -1,6 +1,7 @@
-import { lstat, mkdir, open, readdir, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { lstat, mkdir, open, readdir, realpath, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, normalize, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, normalize, relative, resolve } from "node:path";
 import type { PrimitiveHandler, PrimitiveResult } from "./types.ts";
 
 export const FILE_READ_LIMIT_BYTES = 1024 * 1024;
@@ -16,6 +17,10 @@ interface ResolvedFilePath {
   resolvedPath: string;
 }
 
+interface EffectiveResolvedFilePath extends ResolvedFilePath {
+  effectivePath: string;
+}
+
 interface BlockedPath {
   path: string;
   type: "file" | "directory";
@@ -25,8 +30,8 @@ export function createFileReadHandler(options: FileHandlerOptions): PrimitiveHan
   return async (params) => {
     try {
       const requestedPath = requirePath(params.path);
-      const target = resolveFilePath(requestedPath, options);
-      const blockedPath = getBlockedPath(target.resolvedPath, getReadBlockedPaths(options));
+      const target = await resolveEffectiveFilePath(requestedPath, options);
+      const blockedPath = await getBlockedPath(target.effectivePath, getReadBlockedPaths(options));
 
       if (blockedPath) {
         return {
@@ -101,8 +106,8 @@ export function createFileWriteHandler(options: FileHandlerOptions): PrimitiveHa
     try {
       const requestedPath = requirePath(params.path);
       const content = requireContent(params.content);
-      const target = resolveFilePath(requestedPath, options);
-      const blockedPath = getBlockedPath(target.resolvedPath, getWriteBlockedPaths(options));
+      const target = await resolveEffectiveFilePath(requestedPath, options);
+      const blockedPath = await getBlockedPath(target.effectivePath, getWriteBlockedPaths(options));
 
       if (blockedPath) {
         return {
@@ -161,7 +166,7 @@ function requireContent(value: unknown): string {
   return value;
 }
 
-function resolveFilePath(path: string, options: FileHandlerOptions): ResolvedFilePath {
+export function resolveFilePath(path: string, options: FileHandlerOptions): ResolvedFilePath {
   const homeDir = options.homeDir ?? dirname(options.agentHome) ?? homedir();
   const expandedPath = path === "~" || path.startsWith("~/")
     ? resolve(homeDir, path.slice(2))
@@ -173,6 +178,63 @@ function resolveFilePath(path: string, options: FileHandlerOptions): ResolvedFil
       ? resolve(expandedPath)
       : resolve(options.workspaceDir, expandedPath),
   };
+}
+
+export async function resolveEffectiveFilePath(path: string, options: FileHandlerOptions): Promise<EffectiveResolvedFilePath> {
+  const resolvedPath = resolveFilePath(path, options);
+
+  return {
+    ...resolvedPath,
+    effectivePath: await resolveEffectiveFilesystemTarget(resolvedPath.resolvedPath),
+  };
+}
+
+export async function resolveEffectiveFilesystemTarget(targetPath: string): Promise<string> {
+  const normalizedPath = resolve(targetPath);
+  const pendingSegments: string[] = [];
+  let currentPath = normalizedPath;
+
+  while (true) {
+    try {
+      return normalize(resolve(await realpath(currentPath), ...pendingSegments));
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+
+      const parentPath = dirname(currentPath);
+      if (parentPath === currentPath) {
+        return normalizedPath;
+      }
+
+      pendingSegments.unshift(basename(currentPath));
+      currentPath = parentPath;
+    }
+  }
+}
+
+export function resolveEffectiveFilesystemTargetSync(targetPath: string): string {
+  const normalizedPath = resolve(targetPath);
+  const pendingSegments: string[] = [];
+  let currentPath = normalizedPath;
+
+  while (true) {
+    try {
+      return normalize(resolve(realpathSync(currentPath), ...pendingSegments));
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error;
+      }
+
+      const parentPath = dirname(currentPath);
+      if (parentPath === currentPath) {
+        return normalizedPath;
+      }
+
+      pendingSegments.unshift(basename(currentPath));
+      currentPath = parentPath;
+    }
+  }
 }
 
 function getReadBlockedPaths(options: FileHandlerOptions): BlockedPath[] {
@@ -191,13 +253,15 @@ function getWriteBlockedPaths(options: FileHandlerOptions): BlockedPath[] {
   ];
 }
 
-function getBlockedPath(targetPath: string, blockedPaths: BlockedPath[]): string | null {
+async function getBlockedPath(targetPath: string, blockedPaths: BlockedPath[]): Promise<string | null> {
   for (const blockedPath of blockedPaths) {
-    if (blockedPath.type === "file" && normalize(targetPath) === normalize(blockedPath.path)) {
+    const effectiveBlockedPath = await resolveEffectiveFilesystemTarget(blockedPath.path);
+
+    if (blockedPath.type === "file" && normalize(targetPath) === normalize(effectiveBlockedPath)) {
       return blockedPath.path;
     }
 
-    if (blockedPath.type === "directory" && isSameOrDescendant(targetPath, blockedPath.path)) {
+    if (blockedPath.type === "directory" && isSameOrDescendant(targetPath, effectiveBlockedPath)) {
       return blockedPath.path;
     }
   }

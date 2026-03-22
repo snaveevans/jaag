@@ -5,6 +5,7 @@ import { SYSTEM_TOOL_DECLARATIONS } from "../system-tools/handler.ts";
 export interface SystemPromptOptions {
   now?: Date;
   toolManifests?: ToolManifest[];
+  policySummary?: string;
 }
 
 export function buildBaseSystemPrompt(options: SystemPromptOptions = {}): string {
@@ -29,6 +30,7 @@ export function buildBaseSystemPrompt(options: SystemPromptOptions = {}): string
     "Use memory for persistent notes and preferences. `set`, `get`, and `delete` use domain + key; `search` uses full-text matching; `list` can inspect a domain or the full store.",
     "Use file_read for both files and directories. Relative paths resolve against the current workspace. Large files are truncated at 1MB and protected runtime paths are blocked.",
     "Use file_write to create or replace full file contents. Relative paths resolve against the current workspace, parent directories are created automatically, and protected runtime paths are blocked.",
+    options.policySummary ? `Policy summary: ${options.policySummary}` : null,
     `Current time: ${now.toISOString()}`,
     "Available primitive functions:",
     primitiveList,
@@ -36,5 +38,5 @@ export function buildBaseSystemPrompt(options: SystemPromptOptions = {}): string
     systemToolList,
     "Installed tool manifests:",
     toolManifestList,
-  ].join("\n\n");
+  ].filter(Boolean).join("\n\n");
 }

@@ -2,6 +2,33 @@
 
 This file is a running log of small-but-annoying issues we've hit, plus the fix that worked.
 
+## 2026-03-21 - Symlink-aware path checks and prompt state must be installed before async sends
+
+### Symptom
+
+- File-write policy checks allowed writes that escaped the workspace through symlinked ancestors, and protected runtime paths could be reached through symlink aliases.
+- Interactive prompts could hang when an adapter produced a reply during `send(...)` before the runtime finished registering the pending request.
+
+### Cause
+
+- File safety checks compared lexical paths instead of the effective filesystem target after resolving symlinked ancestors.
+- `src/runtime/agent.ts` awaited the outbound send before storing the pending prompt resolver, so a fast inbound reply hit the normal queue instead of the prompt waiter.
+
+### Fix
+
+- Resolve file targets against the real filesystem path, walking up to the nearest existing ancestor for yet-to-be-created files, and use that effective target for both protected-path checks and file policy matching.
+- Create the pending prompt request before calling `adapter.send(...)`, then clear or reject it only if the send fails before a response arrives.
+- Updated files: `src/primitives/file.ts`, `src/primitives/dispatcher.ts`, `src/policy/engine.ts`, `src/runtime/agent.ts`, `src/primitives/file.test.ts`, `src/primitives/dispatcher.test.ts`, `src/policy/engine.test.ts`, `src/runtime/agent.test.ts`
+
+### How to avoid next time
+
+- For any security-sensitive file allowlist or blocklist, compare canonical effective targets, not just normalized strings.
+- When waiting for an async reply, install the pending state before the outbound operation that can trigger the reply.
+
+### Evidence (optional)
+
+- Validation: `bun test src/primitives/file.test.ts src/primitives/dispatcher.test.ts src/policy/engine.test.ts src/runtime/agent.test.ts`; `bun test`; `bun run typecheck`
+
 ## 2026-03-21 - Strict TS dislikes mixed nullish/or chains and overly-wide helper returns
 
 ### Symptom

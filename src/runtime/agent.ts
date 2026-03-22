@@ -2,14 +2,22 @@ import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMess
 import type { LLMProvider } from "../llm/provider.ts";
 import type { ModelConfig, ToolCall } from "../llm/types.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
-import type { PrimitiveContext } from "../primitives/types.ts";
+import type {
+  ApprovalReceiptLookup,
+  InteractionHandler,
+  PrimitiveContext,
+  PromptOptions,
+  ApprovalRequestOptions,
+} from "../primitives/types.ts";
+import { createApprovalReceipt } from "../policy/receipts.ts";
 import { SessionManager } from "../session/manager.ts";
 import type { AgentSession } from "../session/session.ts";
 
-const AUTHORIZATION_CODE_TIMEOUT_MS = 5 * 60 * 1000;
+const USER_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 
-interface PendingAuthorizationCodeRequest {
-  resolve: (authorizationCode: string) => void;
+interface PendingUserResponseRequest {
+  promise: Promise<string>;
+  resolve: (content: string) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -33,7 +41,7 @@ export class AgentRuntime {
   private readonly sessionManager: SessionManager;
   private readonly primitiveDispatcher: PrimitiveDispatcher;
   private readonly inboundQueue: InboundMessage[] = [];
-  private pendingAuthorizationCodeRequest: PendingAuthorizationCodeRequest | null = null;
+  private pendingUserResponseRequest: PendingUserResponseRequest | null = null;
   private drainPromise: Promise<void> | null = null;
   private started = false;
   private shuttingDown = false;
@@ -47,6 +55,7 @@ export class AgentRuntime {
     this.primitiveDispatcher.setAuthorizationCodeHandler(async (message, context) => {
       return await this.requestAuthorizationCode(message, context);
     });
+    this.primitiveDispatcher.setInteractionHandler(this.createInteractionHandler());
   }
 
   start(): void {
@@ -60,8 +69,8 @@ export class AgentRuntime {
         return;
       }
 
-      if (this.pendingAuthorizationCodeRequest) {
-        this.resolvePendingAuthorizationCodeRequest(message.content);
+      if (this.pendingUserResponseRequest) {
+        this.resolvePendingUserResponseRequest(message.content);
         return;
       }
 
@@ -72,7 +81,7 @@ export class AgentRuntime {
 
   async shutdown(timeoutMs = 30_000): Promise<boolean> {
     this.shuttingDown = true;
-    this.rejectPendingAuthorizationCodeRequest("Runtime is shutting down.");
+    this.rejectPendingUserResponseRequest("Runtime is shutting down.");
     return this.waitForIdle(timeoutMs);
   }
 
@@ -253,67 +262,195 @@ export class AgentRuntime {
   }
 
   private async requestAuthorizationCode(message: string, context: PrimitiveContext): Promise<string> {
-    if (this.shuttingDown) {
-      throw new Error("Runtime is shutting down.");
+    return await this.requestTextResponse(message, context, {
+      timeoutMs: USER_RESPONSE_TIMEOUT_MS,
+      timeoutError: "Timed out waiting for an OAuth authorization code from the user.",
+    });
+  }
+
+  private createInteractionHandler(): InteractionHandler {
+    return {
+      notify: async (message, context) => await this.sendNotification(message, context),
+      ask: async (message, context, options) => await this.askUser(message, context, options),
+      requestApproval: async (message, context, options) => await this.requestUserApproval(message, context, options),
+      hasApprovalReceipt: (context, criteria) => this.hasApprovalReceipt(context, criteria),
+    };
+  }
+
+  private async sendNotification(message: string, context: PrimitiveContext): Promise<DeliveryResult> {
+    this.ensureActiveSession(context.sessionId, "send a notification to");
+    return await this.adapter.send({
+      sessionId: context.sessionId,
+      mode: "notify",
+      content: message,
+      format: "plain",
+    });
+  }
+
+  private async askUser(message: string, context: PrimitiveContext, options: PromptOptions = {}): Promise<string> {
+    return await this.requestTextResponse(message, context, {
+      timeoutMs: options.timeoutMs ?? USER_RESPONSE_TIMEOUT_MS,
+      timeoutError: "Timed out waiting for a reply from the user.",
+    });
+  }
+
+  private async requestUserApproval(
+    message: string,
+    context: PrimitiveContext,
+    options: ApprovalRequestOptions = {},
+  ): Promise<boolean> {
+    const response = await this.awaitUserResponse({
+      sessionId: context.sessionId,
+      mode: "approve",
+      content: message,
+      actions: [
+        { label: "Allow", value: "yes" },
+        { label: "Deny", value: "no" },
+      ],
+      format: "plain",
+    }, context, {
+      timeoutMs: options.timeoutMs ?? USER_RESPONSE_TIMEOUT_MS,
+      timeoutError: "Timed out waiting for an approval decision from the user.",
+      pendingError: "Another user prompt is already waiting for a response.",
+    });
+
+    const approved = parseApprovalResponse(response);
+    if (approved && options.recordReceipt) {
+      const session = this.ensureActiveSession(context.sessionId, "record an approval receipt for");
+      session.addApprovalReceipt(createApprovalReceipt({
+        timestamp: new Date(),
+        tool: options.tool,
+        operation: options.operation,
+        summary: options.summary ?? message,
+      }));
     }
 
+    return approved;
+  }
+
+  private hasApprovalReceipt(context: PrimitiveContext, criteria: ApprovalReceiptLookup): boolean {
     const session = this.sessionManager.getSession(context.sessionId);
-    if (!session || session.isTerminal()) {
-      throw new Error(`Cannot request an OAuth authorization code for inactive session ${context.sessionId}.`);
+    if (!session) {
+      return false;
     }
 
-    if (this.pendingAuthorizationCodeRequest) {
-      throw new Error("Another OAuth authorization request is already waiting for a user response.");
-    }
+    return session.hasApprovalReceipt({
+      tool: criteria.tool,
+      operation: criteria.operation,
+      now: criteria.now,
+      maxAgeMs: criteria.maxAgeMs,
+    });
+  }
 
-    await this.adapter.send({
+  private async requestTextResponse(
+    message: string,
+    context: PrimitiveContext,
+    options: { timeoutMs: number; timeoutError: string },
+  ): Promise<string> {
+    return await this.awaitUserResponse({
       sessionId: context.sessionId,
       mode: "ask",
       content: message,
       format: "plain",
-    });
-
-    return await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pendingAuthorizationCodeRequest = null;
-        reject(new Error("Timed out waiting for an OAuth authorization code from the user."));
-      }, AUTHORIZATION_CODE_TIMEOUT_MS);
-
-      this.pendingAuthorizationCodeRequest = {
-        resolve,
-        reject,
-        timer,
-      };
+    }, context, {
+      timeoutMs: options.timeoutMs,
+      timeoutError: options.timeoutError,
+      pendingError: "Another user prompt is already waiting for a response.",
     });
   }
 
-  private resolvePendingAuthorizationCodeRequest(content: string): void {
-    const request = this.pendingAuthorizationCodeRequest;
+  private async awaitUserResponse(
+    message: OutboundMessage,
+    context: PrimitiveContext,
+    options: { timeoutMs: number; timeoutError: string; pendingError: string },
+  ): Promise<string> {
+    if (this.shuttingDown) {
+      throw new Error("Runtime is shutting down.");
+    }
+
+    this.ensureActiveSession(context.sessionId, "prompt");
+
+    if (this.pendingUserResponseRequest) {
+      throw new Error(options.pendingError);
+    }
+
+    const request = this.createPendingUserResponseRequest(options.timeoutMs, options.timeoutError);
+    this.pendingUserResponseRequest = request;
+
+    try {
+      await this.adapter.send(message);
+    } catch (error) {
+      if (this.pendingUserResponseRequest === request) {
+        this.pendingUserResponseRequest = null;
+        clearTimeout(request.timer);
+        request.reject(new Error(toErrorMessage(error)));
+      }
+    }
+
+    return await request.promise;
+  }
+
+  private createPendingUserResponseRequest(timeoutMs: number, timeoutError: string): PendingUserResponseRequest {
+    let resolveRequest!: (content: string) => void;
+    let rejectRequest!: (error: Error) => void;
+
+    const promise = new Promise<string>((resolve, reject) => {
+      resolveRequest = resolve;
+      rejectRequest = reject;
+    });
+
+    const request: PendingUserResponseRequest = {
+      promise,
+      resolve: resolveRequest,
+      reject: rejectRequest,
+      timer: setTimeout(() => {
+        if (this.pendingUserResponseRequest === request) {
+          this.pendingUserResponseRequest = null;
+        }
+
+        rejectRequest(new Error(timeoutError));
+      }, timeoutMs),
+    };
+
+    return request;
+  }
+
+  private resolvePendingUserResponseRequest(content: string): void {
+    const request = this.pendingUserResponseRequest;
     if (!request) {
       return;
     }
 
-    this.pendingAuthorizationCodeRequest = null;
+    this.pendingUserResponseRequest = null;
     clearTimeout(request.timer);
 
-    const authorizationCode = content.trim();
-    if (authorizationCode === "") {
-      request.reject(new Error("Received an empty OAuth authorization code from the user."));
+    const renderedContent = content.trim();
+    if (renderedContent === "") {
+      request.reject(new Error("Received an empty response from the user."));
       return;
     }
 
-    request.resolve(authorizationCode);
+    request.resolve(renderedContent);
   }
 
-  private rejectPendingAuthorizationCodeRequest(message: string): void {
-    const request = this.pendingAuthorizationCodeRequest;
+  private rejectPendingUserResponseRequest(message: string): void {
+    const request = this.pendingUserResponseRequest;
     if (!request) {
       return;
     }
 
-    this.pendingAuthorizationCodeRequest = null;
+    this.pendingUserResponseRequest = null;
     clearTimeout(request.timer);
     request.reject(new Error(message));
+  }
+
+  private ensureActiveSession(sessionId: string, action: string): AgentSession {
+    const session = this.sessionManager.getSession(sessionId);
+    if (!session || session.isTerminal()) {
+      throw new Error(`Cannot ${action} inactive session ${sessionId}.`);
+    }
+
+    return session;
   }
 }
 
@@ -327,4 +464,17 @@ function toErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function parseApprovalResponse(content: string): boolean {
+  const normalized = content.trim().toLowerCase();
+  if (["yes", "y", "approve", "approved", "allow", "allowed", "ok", "okay", "true"].includes(normalized)) {
+    return true;
+  }
+
+  if (["no", "n", "deny", "denied", "reject", "rejected", "false"].includes(normalized)) {
+    return false;
+  }
+
+  return false;
 }

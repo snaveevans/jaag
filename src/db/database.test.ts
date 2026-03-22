@@ -52,6 +52,13 @@ describe("initializeDatabase", () => {
     database.run("DELETE FROM memory WHERE domain IS NULL AND key = ?", ["pref"]);
 
     expect(searchCount(database, "notes")).toBe(0);
+
+    database.run("INSERT INTO rate_limits (rule_id, timestamp) VALUES (?, ?)", [
+      "rule-1",
+      new Date("2026-03-21T00:00:00.000Z").toISOString(),
+    ]);
+    const rateLimitCount = database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM rate_limits").get();
+    expect(rateLimitCount?.count).toBe(1);
   });
 });
 

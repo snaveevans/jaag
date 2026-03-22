@@ -64,5 +64,13 @@ export function runDatabaseMigrations(database: Database): void {
     END
   `);
 
+  database.run(`
+    CREATE TABLE IF NOT EXISTS rate_limits (
+      rule_id TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      PRIMARY KEY (rule_id, timestamp)
+    )
+  `);
+
   database.run(`INSERT INTO memory_fts(memory_fts) VALUES ('rebuild')`);
 }

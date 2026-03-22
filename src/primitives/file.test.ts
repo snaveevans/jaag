@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, open, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FILE_READ_LIMIT_BYTES, createFileReadHandler, createFileWriteHandler } from "./file.ts";
@@ -181,6 +181,39 @@ describe("file primitives", () => {
     expect(blockedConfigWrite).toMatchObject({
       success: false,
       error: `Write blocked: ${join(harness.agentHome, "config.yaml")} is protected by the runtime.`,
+    });
+  });
+
+  test("blocks protected paths reached through symlinked ancestors", async () => {
+    const harness = await createHarness();
+    const protectedDir = join(harness.homeDir, ".agent-policy");
+    await mkdir(protectedDir, { recursive: true });
+    await Bun.write(join(protectedDir, "policy.yaml"), "rules:\n");
+    await symlink(protectedDir, join(harness.workspaceDir, "policy-link"));
+
+    const blockedRead = await harness.readHandler(
+      {
+        path: "policy-link/policy.yaml",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(blockedRead).toMatchObject({
+      success: false,
+      error: `Read blocked: ${protectedDir} is protected by the runtime.`,
+    });
+
+    const blockedWrite = await harness.writeHandler(
+      {
+        path: "policy-link/new-policy.yaml",
+        content: "deny: all\n",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(blockedWrite).toMatchObject({
+      success: false,
+      error: `Write blocked: ${protectedDir} is protected by the runtime.`,
     });
   });
 

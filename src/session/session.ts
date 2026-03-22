@@ -1,4 +1,9 @@
 import type { InternalMessage, ToolCall } from "../llm/types.ts";
+import {
+  findMatchingApprovalReceipt,
+  type ApprovalReceipt,
+  type ApprovalReceiptCriteria,
+} from "../policy/receipts.ts";
 
 export type TriggerSource = "user" | "schedule";
 
@@ -23,6 +28,7 @@ export class AgentSession {
   readonly triggerSource: TriggerSource;
   status: SessionStatus;
   readonly messages: InternalMessage[];
+  readonly approvalReceipts: ApprovalReceipt[];
   readonly createdAt: Date;
   lastActivityAt: Date;
   iterationCount: number;
@@ -36,6 +42,7 @@ export class AgentSession {
     this.triggerSource = options.triggerSource ?? "user";
     this.status = "waiting_for_user";
     this.messages = [{ role: "system", content: options.systemPrompt }];
+    this.approvalReceipts = [];
     this.createdAt = createdAt;
     this.lastActivityAt = createdAt;
     this.iterationCount = 0;
@@ -67,6 +74,19 @@ export class AgentSession {
     });
     this.status = "active";
     this.touch(at);
+  }
+
+  addApprovalReceipt(receipt: ApprovalReceipt): void {
+    this.approvalReceipts.push(receipt);
+    this.touch(receipt.timestamp);
+  }
+
+  findApprovalReceipt(criteria: ApprovalReceiptCriteria): ApprovalReceipt | null {
+    return findMatchingApprovalReceipt(this.approvalReceipts, criteria);
+  }
+
+  hasApprovalReceipt(criteria: ApprovalReceiptCriteria): boolean {
+    return this.findApprovalReceipt(criteria) !== null;
   }
 
   incrementIteration(count = 1, at = new Date()): number {

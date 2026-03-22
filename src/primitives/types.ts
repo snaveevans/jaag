@@ -1,3 +1,4 @@
+import type { DeliveryResult } from "../communication/adapter.ts";
 import type { ToolDeclaration } from "../llm/types.ts";
 
 export interface PrimitiveResult {
@@ -8,6 +9,31 @@ export interface PrimitiveResult {
 
 export interface PrimitiveContext {
   sessionId: string;
+}
+
+export interface PromptOptions {
+  timeoutMs?: number;
+}
+
+export interface ApprovalRequestOptions extends PromptOptions {
+  tool?: string;
+  operation?: string;
+  summary?: string;
+  recordReceipt?: boolean;
+}
+
+export interface ApprovalReceiptLookup {
+  tool: string;
+  operation: string;
+  now?: Date;
+  maxAgeMs?: number;
+}
+
+export interface InteractionHandler {
+  notify(message: string, context: PrimitiveContext): Promise<DeliveryResult>;
+  ask(message: string, context: PrimitiveContext, options?: PromptOptions): Promise<string>;
+  requestApproval(message: string, context: PrimitiveContext, options?: ApprovalRequestOptions): Promise<boolean>;
+  hasApprovalReceipt(context: PrimitiveContext, criteria: ApprovalReceiptLookup): boolean;
 }
 
 export type PrimitiveHandler = (
@@ -127,6 +153,8 @@ export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
       properties: {
         mode: { type: "string", description: "Interaction mode: ask, notify, or approve." },
         message: { type: "string", description: "Text shown to the user." },
+        tool: { type: "string", description: "Optional tool id associated with an approval request." },
+        operation: { type: "string", description: "Optional tool operation associated with an approval request." },
       },
       required: ["mode", "message"],
       additionalProperties: true,

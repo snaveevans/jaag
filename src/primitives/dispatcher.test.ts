@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDatabaseMigrations } from "../db/migrations.ts";
@@ -111,6 +111,20 @@ describe("PrimitiveDispatcher", () => {
         ],
       },
     });
+
+    const blockedWrite = await dispatcher.dispatch(
+      "file_write",
+      {
+        path: join(rootDir, "outside.txt"),
+        content: "should be blocked",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(blockedWrite).toMatchObject({
+      success: false,
+      error: expect.stringContaining("Policy blocked"),
+    });
   });
 
   test("routes raw http, system tools, and spec-backed operations", async () => {
@@ -194,5 +208,48 @@ describe("PrimitiveDispatcher", () => {
     } finally {
       server.stop(true);
     }
+  });
+
+  test("blocks file writes that escape the workspace through symlinked ancestors", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-dispatcher-symlink-"));
+    tempDirs.push(rootDir);
+
+    const homeDir = join(rootDir, "home");
+    const agentHome = join(homeDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    const outsideDir = join(rootDir, "outside");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    await symlink(outsideDir, join(workspaceDir, "escape"));
+
+    const database = new Database(":memory:", {
+      create: true,
+      strict: true,
+    });
+    database.run("PRAGMA journal_mode = WAL");
+    runDatabaseMigrations(database);
+    databases.push(database);
+
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+      getDatabase: () => database,
+    });
+
+    const writeResult = await dispatcher.dispatch(
+      "file_write",
+      {
+        path: "escape/leak.txt",
+        content: "should stay blocked",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(writeResult).toMatchObject({
+      success: false,
+      error: expect.stringContaining("Policy blocked"),
+    });
+    expect(await Bun.file(join(outsideDir, "leak.txt")).exists()).toBe(false);
   });
 });
