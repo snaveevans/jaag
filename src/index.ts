@@ -53,6 +53,7 @@ async function main(): Promise<void> {
       sessionManager: new SessionManager({
         buildSystemPrompt: (now) => buildBaseSystemPrompt({
           now,
+          policySummary: primitiveDispatcher.getPolicySummary(),
           toolManifests: primitiveDispatcher.listToolManifests(),
         }),
       }),
