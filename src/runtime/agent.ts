@@ -267,6 +267,10 @@ export class AgentRuntime {
         return;
       }
 
+      if (options.completeOnAssistantText && canCompleteTriggeredSessionWithoutAssistantText(session)) {
+        return;
+      }
+
       throw new Error("LLM returned no text or tool calls.");
     }
   }
@@ -658,6 +662,72 @@ function toErrorMessage(error: unknown): string {
 
 function shouldAppendSpecRegisterFreshnessNote(toolName: string, toolResult: unknown): boolean {
   return toolName === "spec.register" && toolResult !== null && typeof toolResult === "object" && (toolResult as { success?: unknown }).success === true;
+}
+
+function canCompleteTriggeredSessionWithoutAssistantText(session: AgentSession): boolean {
+  let index = session.messages.length - 1;
+  const toolResultMessages = [] as Array<{ toolResultId?: string; content: string }>;
+
+  while (index >= 0 && session.messages[index]?.role === "tool_result") {
+    const message = session.messages[index];
+    if (message) {
+      toolResultMessages.unshift({
+        toolResultId: message.toolResultId,
+        content: message.content,
+      });
+    }
+    index -= 1;
+  }
+
+  if (toolResultMessages.length === 0) {
+    return false;
+  }
+
+  const assistantMessage = session.messages[index];
+  if (!assistantMessage || assistantMessage.role !== "assistant" || !assistantMessage.toolCalls || assistantMessage.toolCalls.length === 0) {
+    return false;
+  }
+
+  if (assistantMessage.toolCalls.length !== toolResultMessages.length) {
+    return false;
+  }
+
+  const successfulToolResultIds = new Set(
+    toolResultMessages
+      .filter((message) => typeof message.toolResultId === "string" && isSuccessfulPrimitiveResult(message.content))
+      .map((message) => message.toolResultId as string),
+  );
+
+  return assistantMessage.toolCalls.every((toolCall) => {
+    return isFireAndForgetNotifyToolCall(toolCall) && successfulToolResultIds.has(toolCall.id);
+  });
+}
+
+function isFireAndForgetNotifyToolCall(toolCall: ToolCall): boolean {
+  if (toolCall.name !== "interact") {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(toolCall.arguments) as unknown;
+    return parsed !== null
+      && typeof parsed === "object"
+      && !Array.isArray(parsed)
+      && (parsed as { mode?: unknown }).mode === "notify";
+  } catch {
+    return false;
+  }
+}
+
+function isSuccessfulPrimitiveResult(content: string): boolean {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    return parsed !== null
+      && typeof parsed === "object"
+      && (parsed as { success?: unknown }).success === true;
+  } catch {
+    return false;
+  }
 }
 
 function parseApprovalResponse(content: string): ApprovalDecision {

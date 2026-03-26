@@ -1,12 +1,12 @@
-# Scheduled trigger execution can still fail when a schedule fires
+# Scheduled trigger execution could fail when a schedule fired
 
-- Status: open
+- Status: resolved
 
 ## Symptom
 
-- Schedule creation succeeds.
-- The failure still appears later when the scheduled item actually fires and enters the triggered-session path.
-- The end-to-end schedule plus `interact(mode: notify)` flow is still not reliable enough to call fixed.
+- Schedule creation succeeded.
+- The failure appeared later when the scheduled item actually fired and entered the triggered-session path.
+- The end-to-end schedule plus `interact(mode: notify)` flow was not reliable enough to call fixed.
 
 ## Reproduction outline
 
@@ -15,24 +15,26 @@
 3. Wait for the scheduler to fire the item through the normal triggered-session path.
 4. Observe that the triggered execution can still fail when the schedule fires, even though creation worked.
 
-## Known
+## Resolution
 
-- Schedule creation works.
-- We already fixed one concrete provider serialization bug where assistant tool-call content was sent as `""` instead of `null`.
-- That fix addressed a real failure mode, but it did not fully resolve the end-to-end triggered-session failure.
+- The remaining gap was closed by adding end-to-end regression coverage for the full documented path:
+  - persisted schedule creation
+  - scheduler fire via `SchedulerService`
+  - triggered runtime launch via `AgentRuntime`
+  - real OpenAI-compatible request serialization / translation
+  - trailing `interact(mode: notify)` completion with no final assistant text
+- The regression now proves the triggered follow-up request serializes assistant tool-call content as `null` at the provider boundary and that the fired schedule completes successfully.
 
-## Unknown
+## Covered now
 
-- The remaining root cause in the fired scheduled-session path is still not isolated.
-- It is not yet confirmed whether the remaining failure is in runtime triggered-session handling, provider translation, or the boundary between them.
+- A fired once-schedule created through the real schedule primitive can execute end-to-end through the documented notify-only path.
+- Success is recorded back to the persisted schedule (`last_fire_status = 'success'`).
 
-## Workaround
+## Not claimed by this closure
 
-- Use manual or dispatcher-level testing to validate schedule creation behavior.
-- Avoid relying on triggered `interact` execution for demos until this path is fixed.
+- This does not claim blanket coverage for every triggered-session scenario or broader degraded-provider hardening work.
+- Future bugs in other triggered flows should be tracked separately from this resolved notify-path defect.
 
-## Likely touchpoints for a future fix
+## Regression reference
 
-- runtime triggered-session path
-- provider translation for triggered runs
-- schedule-fire to session-bootstrap to `interact(notify)` execution boundary
+- `src/scheduler/service.test.ts` — `fires persisted schedules through runtime and completes notify-only runs across OpenAI translation`

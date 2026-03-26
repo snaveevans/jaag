@@ -613,6 +613,40 @@ class TriggeredAskTimeoutProvider implements LLMProvider {
   }
 }
 
+class TriggeredNotifyOnlyProvider implements LLMProvider {
+  callCount = 0;
+
+  async *stream(
+    messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    this.callCount += 1;
+
+    if (this.callCount === 1) {
+      yield {
+        type: "tool_call_start",
+        toolCall: { id: "call-1", name: "interact", arguments: "" },
+      };
+      yield {
+        type: "tool_call_end",
+        toolCall: {
+          id: "call-1",
+          name: "interact",
+          arguments: '{"mode":"notify","message":"Drink water now."}',
+        },
+      };
+      yield { type: "done" };
+      return;
+    }
+
+    const latestToolResult = [...messages].reverse().find((message) => message.role === "tool_result");
+    expect(latestToolResult?.content).toContain('"success":true');
+
+    yield { type: "done" };
+  }
+}
+
 class ConcurrentTriggeredAskProvider implements LLMProvider {
   async *stream(
     messages: InternalMessage[],
@@ -1454,6 +1488,54 @@ describe("AgentRuntime", () => {
       }));
       expect(adapter.streamChunks).toEqual([
         expect.objectContaining({ content: "Handled timeout." }),
+      ]);
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("completes triggered notify-only sessions when the model stops after the notify tool result", async () => {
+    const adapter = new FakeAdapter();
+    const provider = new TriggeredNotifyOnlyProvider();
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: ({ now, triggeredSchedule }) => buildTriggeredSystemPrompt(now, triggeredSchedule),
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: {
+        model: "fake-model",
+        baseUrl: "http://localhost",
+        temperature: 0,
+        maxOutputTokens: 128,
+        apiKey: "test-key",
+      },
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-trigger-notify-${crypto.randomUUID()}`),
+      }),
+    });
+
+    runtime.start();
+
+    try {
+      const success = await runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-notify",
+        workflow: "hydration",
+        group: null,
+        trigger: { type: "once", at: "2026-03-21T10:05:00.000Z" },
+        context: { instruction: "Notify the user to drink water." },
+        instruction: "Notify the user to drink water.",
+      });
+
+      expect(success).toBe(true);
+      expect(provider.callCount).toBe(2);
+      expect(adapter.sentMessages).toEqual([
+        expect.objectContaining({
+          mode: "notify",
+          content: "Drink water now.",
+        }),
       ]);
       expect(await runtime.waitForIdle(1000)).toBe(true);
     } finally {
