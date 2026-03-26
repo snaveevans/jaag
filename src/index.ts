@@ -1,3 +1,4 @@
+import { mkdir } from "node:fs/promises";
 import { loadConfig, resolveAgentHome } from "./config/loader.ts";
 import { WebSocketCommunicationAdapter } from "./communication/websocket.ts";
 import { OpenAICompatibleProvider } from "./llm/openai.ts";
@@ -9,6 +10,7 @@ import { AgentRuntime } from "./runtime/agent.ts";
 import { acquirePidFile } from "./runtime/pid.ts";
 import { buildBaseSystemPrompt } from "./runtime/system-prompt.ts";
 import { closeDatabase, getDatabase } from "./db/database.ts";
+import { resolveExecuteWorkspaceDir } from "./config/schema.ts";
 
 async function main(): Promise<void> {
   const agentHome = resolveAgentHome();
@@ -41,10 +43,13 @@ async function main(): Promise<void> {
   try {
     const config = await loadConfig();
     getDatabase({ agentHome: config.agentHome });
+    const executeWorkspaceDir = resolveExecuteWorkspaceDir(config.agentHome);
+    await mkdir(executeWorkspaceDir, { recursive: true });
     const primitiveDispatcher = new PrimitiveDispatcher({
       agentHome: config.agentHome,
       timeZone: config.runtime.timezone,
       workspaceDir: process.cwd(),
+      executeWorkspaceDir,
     });
     adapter = new WebSocketCommunicationAdapter({
       port: config.communication.port,

@@ -137,7 +137,7 @@ function toOpenAIMessages(messages: InternalMessage[], toolNameMap: ToolNameMap)
     if (message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0) {
       return {
         role: "assistant",
-        content: message.content || "",
+        content: message.content === "" ? null : message.content,
         tool_calls: message.toolCalls.map((toolCall) => ({
           id: toolCall.id,
           type: "function",

@@ -2,6 +2,31 @@
 
 This file is a running log of small-but-annoying issues we've hit, plus the fix that worked.
 
+## 2026-03-25 - OpenAI-compatible tool-call turns must not send empty assistant content
+
+### Symptom
+
+- A follow-up request after a scheduled run that called `interact(mode: notify)` failed against MiniMax with `400 invalid params, chat content is empty`.
+
+### Cause
+
+- `src/llm/openai.ts` serialized assistant messages that contained tool calls but no text as `content: ""`.
+- Some OpenAI-compatible providers reject empty-string assistant content on tool-call turns.
+
+### Fix
+
+- Normalize assistant tool-call messages with empty text to `content: null` instead of `""` in `src/llm/openai.ts`.
+- Add a regression test in `src/llm/openai.test.ts` that captures the outgoing request body and asserts the tool-call assistant message no longer sends empty-string content.
+
+### How to avoid next time
+
+- When translating to provider-specific chat payloads, treat empty assistant content on tool-call turns as nullable/omittable metadata, not as a literal empty string.
+- Keep request-body regression tests around provider-compatibility quirks at the serialization boundary.
+
+### Evidence (optional)
+
+- Validation: `bun test src/llm/openai.test.ts --test-name-pattern "serializes assistant tool-call messages without empty string content"`; `bun test src/llm/openai.test.ts`; `bun test`; `bun run typecheck`
+
 ## 2026-03-21 - Concurrent prompts need a queue, and cron metadata updates must not retime schedules
 
 ### Symptom

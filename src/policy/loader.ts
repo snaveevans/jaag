@@ -18,10 +18,34 @@ import type {
 import { POLICY_ACTIONS, POLICY_PRIMITIVES } from "./types.ts";
 
 const POLICY_DIR_NAME = ".agent-policy";
+const READ_ONLY_EXECUTE_SUMMARY_COMMANDS = new Set([
+  "ls",
+  "ls *",
+  "git status",
+  "git diff",
+  "git diff *",
+  "git log",
+  "git log *",
+]);
+
 const DEFAULT_POLICY_CONTENT = `# Default Agent Policy - secure defaults
 rules:
   - primitive: execute
-    match: { command: ["git status", "git diff *", "git log *", "ls *", "cat *", "head *", "tail *", "wc *", "find *", "which *"] }
+    match:
+      command:
+        - ls
+        - ls *
+        - git status
+        - git diff
+        - git diff *
+        - git log
+        - git log *
+        - cat *
+        - head *
+        - tail *
+        - wc *
+        - find *
+        - which *
     action: allow
 
   - primitive: execute
@@ -356,10 +380,9 @@ function buildPolicySummary(rules: PolicyRule[]): string {
     summaryParts.push("Some file writes are blocked by policy.");
   }
 
-  if (hasCatchAllAction(rules, "execute", "approve")) {
-    summaryParts.push("Shell commands usually require user approval.");
-  } else if (hasCatchAllAction(rules, "execute", "block")) {
-    summaryParts.push("Shell commands are blocked unless a more specific rule allows them.");
+  const executeSummary = describeExecutePolicy(rules);
+  if (executeSummary) {
+    summaryParts.push(executeSummary);
   }
 
   if (hasHttpMutationApproval(rules) && hasHttpReadAllowance(rules)) {
@@ -391,6 +414,42 @@ function hasCatchAllAction(rules: PolicyRule[], primitive: PolicyPrimitive, acti
 
 function hasAction(rules: PolicyRule[], primitive: PolicyPrimitive, action: PolicyRule["action"]): boolean {
   return rules.some((rule) => rule.primitive === primitive && rule.action === action);
+}
+
+function describeExecutePolicy(rules: PolicyRule[]): string | null {
+  const hasReadOnlyAllowance = hasReadOnlyExecuteAllowance(rules);
+
+  if (hasReadOnlyAllowance && hasCatchAllAction(rules, "execute", "approve")) {
+    return "Common read-only shell commands like ls and git status/diff/log can run without approval; most other shell commands usually require user approval.";
+  }
+
+  if (hasReadOnlyAllowance && hasCatchAllAction(rules, "execute", "block")) {
+    return "Common read-only shell commands like ls and git status/diff/log are allowed; other shell commands are blocked unless a more specific rule allows them.";
+  }
+
+  if (hasReadOnlyAllowance) {
+    return "Some read-only shell commands like ls and git status/diff/log are allowed without approval.";
+  }
+
+  if (hasCatchAllAction(rules, "execute", "approve")) {
+    return "Shell commands usually require user approval.";
+  }
+
+  if (hasCatchAllAction(rules, "execute", "block")) {
+    return "Shell commands are blocked unless a more specific rule allows them.";
+  }
+
+  return null;
+}
+
+function hasReadOnlyExecuteAllowance(rules: PolicyRule[]): boolean {
+  return rules.some(
+    (rule) => rule.primitive === "execute"
+      && rule.action === "allow"
+      && rule.match !== undefined
+      && "command" in rule.match
+      && Boolean(rule.match.command?.some((command) => READ_ONLY_EXECUTE_SUMMARY_COMMANDS.has(command))),
+  );
 }
 
 function hasHttpReadAllowance(rules: PolicyRule[]): boolean {

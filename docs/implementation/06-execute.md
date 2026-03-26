@@ -39,7 +39,8 @@
      - NOT a security boundary — just catches obvious mistakes
   3. Spawn child process via Bun.spawn:
      - command: parsed from string (split by shell)
-     - cwd: ~/.agent/workspace/ (default, or specified in params)
+     - cwd: ~/.agent/workspace/ by default
+     - if params.cwd is provided, it must still resolve within ~/.agent/workspace/
      - env: sanitized environment (see Task 6.2)
   4. Capture stdout + stderr (combined into structured output)
   5. Apply timeout: 30 seconds (default, configurable)
@@ -66,7 +67,7 @@
 
 ### Task 6.3: Working Directory & Timeout
 - Default working directory: `~/.agent/workspace/`
-- Allow model to specify `cwd` parameter (but still policy-gated for path)
+- Allow model to specify `cwd` parameter, but require the resolved directory to stay within `~/.agent/workspace/`
 - Timeout: 30 seconds default
 - On timeout: kill subprocess, return `{ exitCode: -1, stdout: "...", stderr: "Process timed out after 30 seconds" }`
 
@@ -74,14 +75,14 @@
 - Update dispatcher to route `execute` calls to the handler
 - Update LLM function declarations to include `execute` parameters:
   ```typescript
-  {
-    name: "execute",
-    description: "Run a shell command",
-    parameters: {
-      command: { type: "string", description: "The shell command to run" },
-      cwd: { type: "string", description: "Working directory (optional, defaults to workspace)" }
-    }
-  }
+   {
+     name: "execute",
+     description: "Run a shell command in the execute workspace",
+     parameters: {
+       command: { type: "string", description: "The shell command to run" },
+       cwd: { type: "string", description: "Working directory inside ~/.agent/workspace (optional, defaults to workspace)" }
+     }
+   }
   ```
 
 ---

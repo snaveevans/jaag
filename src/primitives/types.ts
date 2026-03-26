@@ -122,11 +122,17 @@ export const RAW_PRIMITIVE_DECLARATIONS: ToolDeclaration[] = [
   },
   {
     name: "execute",
-    description: "Run a shell command in the agent workspace.",
+    description:
+      "Run a shell command in the execute workspace. Optional cwd values must resolve within ~/.agent/workspace/.",
     parameters: {
       type: "object",
       properties: {
         command: { type: "string", description: "Shell command to execute." },
+        cwd: {
+          type: "string",
+          description:
+            "Optional working directory. Relative, absolute, and ~/ paths are allowed only when they resolve within ~/.agent/workspace/.",
+        },
       },
       required: ["command"],
       additionalProperties: false,

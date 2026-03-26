@@ -20,10 +20,31 @@ describe("policy loader", () => {
     const homeDir = await createHomeDir();
 
     const policy = loadPolicy({ homeDir });
+    const executeAllowRule = policy.rules.find(
+      (rule) => rule.primitive === "execute" && rule.action === "allow",
+    );
 
     expect(policy.installedDefault).toBe(true);
     expect(policy.rules).toHaveLength(10);
     expect(policy.summary).toContain("File writes are limited");
+    expect(policy.summary).toContain("Common read-only shell commands like ls and git status/diff/log can run without approval");
+    expect(executeAllowRule?.match).toEqual({
+      command: [
+        "ls",
+        "ls *",
+        "git status",
+        "git diff",
+        "git diff *",
+        "git log",
+        "git log *",
+        "cat *",
+        "head *",
+        "tail *",
+        "wc *",
+        "find *",
+        "which *",
+      ],
+    });
     expect(await Bun.file(resolvePolicyPath({ homeDir })).exists()).toBe(true);
   });
 

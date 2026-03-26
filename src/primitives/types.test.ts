@@ -109,6 +109,26 @@ describe("primitive tool schemas", () => {
     });
   });
 
+  test("execute declaration exposes command plus optional cwd", () => {
+    const parameters = getPrimitiveParameters("execute");
+    const declaration = RAW_PRIMITIVE_DECLARATIONS.find((tool) => tool.name === "execute");
+
+    expect(parameters).toMatchObject({
+      type: "object",
+      required: ["command"],
+      additionalProperties: false,
+    });
+
+    expect(getSchemaProperties(parameters)).toMatchObject({
+      command: { type: "string" },
+      cwd: { type: "string" },
+    });
+    expect(declaration?.description).toContain("must resolve within ~/.agent/workspace/");
+    expect(getSchemaProperty(parameters, "cwd").description).toBe(
+      "Optional working directory. Relative, absolute, and ~/ paths are allowed only when they resolve within ~/.agent/workspace/.",
+    );
+  });
+
   test("interact declaration exposes an explicit request shape", () => {
     const parameters = getPrimitiveParameters("interact");
 

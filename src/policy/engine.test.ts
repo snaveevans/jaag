@@ -232,6 +232,57 @@ describe("policy engine", () => {
     expect(blocked.action).toBe("block");
     expect(allowed.action).toBe("allow");
   });
+
+  test("matches common read-only execute commands without widening to mutating git commands", async () => {
+    let approvalPrompts = 0;
+    const { engine } = createHarness([
+      {
+        id: "rule-1",
+        primitive: "execute",
+        action: "allow",
+        match: {
+          command: ["ls", "ls *", "git status", "git diff", "git diff *", "git log", "git log *"],
+        },
+      },
+      {
+        id: "rule-2",
+        primitive: "execute",
+        action: "approve",
+        modelApprovalSufficient: false,
+      },
+    ], {
+      requestApproval: async () => {
+        approvalPrompts += 1;
+        return { approved: true, response: "yes" };
+      },
+    });
+
+    const allowedCommands = [
+      "ls",
+      "ls -la",
+      "git status",
+      "git diff",
+      "git diff --stat",
+      "git log",
+      "git log --oneline -5",
+    ];
+
+    for (const command of allowedCommands) {
+      await expect(engine.enforce({
+        primitive: "execute",
+        command,
+      }, SESSION_CONTEXT)).resolves.toMatchObject({ action: "allow" });
+    }
+
+    expect(approvalPrompts).toBe(0);
+
+    await expect(engine.enforce({
+      primitive: "execute",
+      command: "git commit -m test",
+    }, SESSION_CONTEXT)).resolves.toMatchObject({ action: "allow", source: "approved" });
+
+    expect(approvalPrompts).toBe(1);
+  });
 });
 
 function createHarness(

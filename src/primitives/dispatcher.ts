@@ -7,9 +7,10 @@ import {
   type InteractionHandler,
 } from "./types.ts";
 import { RAW_PRIMITIVE_DECLARATIONS } from "./types.ts";
-import { DEFAULT_AGENT_HOME } from "../config/schema.ts";
+import { DEFAULT_AGENT_HOME, resolveExecuteWorkspaceDir } from "../config/schema.ts";
 import { getDatabase } from "../db/database.ts";
 import { createFileReadHandler, createFileWriteHandler, resolveEffectiveFilePath, type FileHandlerOptions } from "./file.ts";
+import { createExecuteHandler } from "./execute/handler.ts";
 import { createMemoryHandler } from "./memory.ts";
 import { createScheduleHandler } from "./schedule.ts";
 import type { AuthDependencies } from "../interpreter/auth.ts";
@@ -27,6 +28,7 @@ const KNOWN_PRIMITIVES = new Set(RAW_PRIMITIVE_DECLARATIONS.map((tool) => tool.n
 export interface PrimitiveDispatcherOptions {
   agentHome?: string;
   workspaceDir?: string;
+  executeWorkspaceDir?: string;
   homeDir?: string;
   timeZone?: string;
   policyPath?: string;
@@ -52,6 +54,7 @@ export class PrimitiveDispatcher {
   constructor(options: PrimitiveDispatcherOptions = {}) {
     const agentHome = options.agentHome ?? DEFAULT_AGENT_HOME;
     const workspaceDir = options.workspaceDir ?? process.cwd();
+    const executeWorkspaceDir = options.executeWorkspaceDir ?? resolveExecuteWorkspaceDir(agentHome);
     const homeDir = options.homeDir ?? dirname(agentHome);
     const getRuntimeDatabase = options.getDatabase ?? ((databaseOptions) => getDatabase(databaseOptions));
     const runtimeDatabase = getRuntimeDatabase({ agentHome });
@@ -98,6 +101,11 @@ export class PrimitiveDispatcher {
       http: async (params) => await interpreter.executeRawHttp(params),
       file_read: createFileReadHandler(fileHandlerOptions),
       file_write: createFileWriteHandler(fileHandlerOptions),
+      execute: createExecuteHandler({
+        executeWorkspaceDir,
+        homeDir,
+        env: options.env,
+      }),
       memory: memoryHandler,
       schedule: createScheduleHandler({
         getDatabase: () => runtimeDatabase,

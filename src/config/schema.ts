@@ -5,7 +5,12 @@ export const AGENT_DIR_NAME = ".agent";
 export const DEFAULT_AGENT_HOME = join(homedir(), AGENT_DIR_NAME);
 export const DEFAULT_CONFIG_PATH = join(DEFAULT_AGENT_HOME, "config.yaml");
 export const DEFAULT_PID_PATH = join(DEFAULT_AGENT_HOME, "agent.pid");
+export const DEFAULT_EXECUTE_WORKSPACE_DIR = join(DEFAULT_AGENT_HOME, "workspace");
 export const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
+
+export function resolveExecuteWorkspaceDir(agentHome = DEFAULT_AGENT_HOME): string {
+  return join(agentHome, "workspace");
+}
 
 export interface RawAgentConfigFile {
   llm?: {

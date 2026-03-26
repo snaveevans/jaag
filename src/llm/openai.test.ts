@@ -104,6 +104,68 @@ describe("OpenAICompatibleProvider", () => {
     ]);
   });
 
+  test("serializes assistant tool-call messages without empty string content", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+
+    const server = Bun.serve({
+      port: 0,
+      fetch: async (request) => {
+        requestBody = (await request.json()) as Record<string, unknown>;
+        return new Response(buildSseBody([]), {
+          headers: {
+            "content-type": "text/event-stream",
+          },
+        });
+      },
+    });
+    servers.push(server);
+
+    const provider = new OpenAICompatibleProvider();
+
+    for await (const _chunk of provider.stream([
+      { role: "user", content: "run the schedule" },
+      {
+        role: "assistant",
+        content: "",
+        toolCalls: [{ id: "call-1", name: "interact", arguments: '{"mode":"notify"}' }],
+      },
+      { role: "tool_result", toolResultId: "call-1", content: '{"ok":true}' },
+    ], [{
+      name: "interact",
+      description: "Send a notification to the user",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string" },
+        },
+        required: ["mode"],
+      },
+    }], {
+      model: "gpt-4o-mini",
+      baseUrl: `http://127.0.0.1:${server.port}/v1`,
+      temperature: 0,
+      maxOutputTokens: 128,
+      apiKey: "test-key",
+    })) {
+      // Consume stream to completion so the request is sent.
+    }
+
+    const sentMessages = requestBody?.messages as Array<Record<string, unknown>>;
+    expect(sentMessages[1]).toMatchObject({
+      role: "assistant",
+      tool_calls: [{
+        id: "call-1",
+        type: "function",
+        function: {
+          name: "interact",
+          arguments: '{"mode":"notify"}',
+        },
+      }],
+    });
+    expect(sentMessages[1]?.content).toBeNull();
+    expect(sentMessages[1]?.content).not.toBe("");
+  });
+
   test("keeps a stable tool-call key when the provider id arrives later", async () => {
     const server = Bun.serve({
       port: 0,
