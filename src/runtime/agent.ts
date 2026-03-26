@@ -1,6 +1,15 @@
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
 import type { LLMProvider } from "../llm/provider.ts";
-import type { ModelConfig, ToolCall } from "../llm/types.ts";
+import type { InternalMessage, ModelConfig, ToolCall, ToolDeclaration } from "../llm/types.ts";
+import {
+  buildCompactionRequestMessages,
+  buildCompactionSummaryMessage,
+  createContextBudgetSnapshot,
+  estimateMessagesTokens,
+  estimateToolDeclarationsTokens,
+  type HistoryCompactionPlan,
+  planHistoryCompaction,
+} from "../context/budget.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
 import type {
   ApprovalReceiptLookup,
@@ -19,6 +28,10 @@ import type { AgentSession } from "../session/session.ts";
 const USER_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const SCHEDULED_USER_RESPONSE_TIMEOUT_MS = 2 * 60 * 1000;
 const SPEC_REGISTER_FRESHNESS_NOTE = "Installed-tool guidance may now be stale after spec.register succeeded. Use spec.list to refresh the current manifest before using newly registered tools.";
+const INTERACTIVE_CONTEXT_LIMIT_NOTICE = "This conversation has grown too large to continue safely. I stored a summary in memory and ended this session. Please send your next message in a fresh session.";
+const INTERACTIVE_CONTEXT_LIMIT_NOTICE_NO_SUMMARY = "This conversation has grown too large to continue safely. I ended this session. Please send your next message in a fresh session.";
+const TRIGGERED_CONTEXT_LIMIT_NOTICE = "Scheduled session ended because it stayed above the context hard ceiling after compaction. A summary was stored in memory.";
+const TRIGGERED_CONTEXT_LIMIT_NOTICE_NO_SUMMARY = "Scheduled session ended because it stayed above the context hard ceiling.";
 
 interface UserResponseRequest {
   promptId: string;
@@ -184,48 +197,14 @@ export class AgentRuntime {
     while (true) {
       session.markWaitingForLLM();
 
-      const assistantTextParts: string[] = [];
-      const toolCallsById = new Map<string, ToolCall>();
-      const toolCallOrder: string[] = [];
-      const toolDeclarations = this.primitiveDispatcher.getToolDeclarations();
-
-      for await (const chunk of this.llmProvider.stream(
-        session.messages,
-        toolDeclarations,
-        this.modelConfig,
-      )) {
-        if (chunk.type === "text" && chunk.content) {
-          assistantTextParts.push(chunk.content);
-          await this.sendStreamChunk(session.id, chunk.content);
-          continue;
-        }
-
-        if (
-          (chunk.type === "tool_call_start" ||
-            chunk.type === "tool_call_delta" ||
-            chunk.type === "tool_call_end") &&
-          chunk.toolCall
-        ) {
-          const toolCallKey = chunk.toolCallKey ?? chunk.toolCall.id;
-          const current = toolCallsById.get(toolCallKey) ?? {
-            id: chunk.toolCall.id,
-            name: "",
-            arguments: "",
-          };
-
-          if (!toolCallsById.has(toolCallKey)) {
-            toolCallOrder.push(toolCallKey);
-          }
-
-          current.id = chunk.toolCall.id;
-          current.name = chunk.toolCall.name;
-          current.arguments = chunk.toolCall.arguments;
-          toolCallsById.set(toolCallKey, current);
-        }
+      if (!await this.ensureSessionWithinContextBudget(session)) {
+        return;
       }
 
-      const assistantText = assistantTextParts.join("");
-      const toolCalls = toolCallOrder.map((toolCallId) => toolCallsById.get(toolCallId)).filter(Boolean) as ToolCall[];
+      const toolDeclarations = this.primitiveDispatcher.getToolDeclarations();
+      const { assistantText, toolCalls } = await this.collectProviderResponse(session.messages, toolDeclarations, {
+        streamSessionId: session.id,
+      });
 
       if (toolCalls.length > 0) {
         session.appendAssistantMessage(assistantText, toolCalls);
@@ -301,6 +280,169 @@ export class AgentRuntime {
       sessionId: session.id,
       triggerSource: session.triggerSource,
     });
+  }
+
+  private async ensureSessionWithinContextBudget(session: AgentSession): Promise<boolean> {
+    const contextLimit = this.modelConfig.contextLimit;
+    if (!contextLimit || !Number.isFinite(contextLimit) || contextLimit <= 0) {
+      return true;
+    }
+
+    let budget = this.getContextBudgetSnapshot(session, contextLimit);
+    if (!budget.shouldCompact) {
+      return true;
+    }
+
+    const compactionPlan = planHistoryCompaction(session.messages);
+    if (!compactionPlan) {
+      return true;
+    }
+
+    const { attempted, summaryStored } = await this.attemptHistoryCompaction(
+      session,
+      compactionPlan,
+      contextLimit,
+    );
+
+    budget = this.getContextBudgetSnapshot(session, contextLimit);
+    if (!attempted || !budget.exceedsHardCeiling) {
+      return true;
+    }
+
+    await this.completeSessionForContextLimit(session, summaryStored);
+    return false;
+  }
+
+  private getContextBudgetSnapshot(session: AgentSession, contextLimit: number) {
+    return createContextBudgetSnapshot({
+      contextLimit,
+      messageTokens: session.getMessageTokenEstimate(),
+      toolDeclarationTokens: estimateToolDeclarationsTokens(this.primitiveDispatcher.getToolDeclarations()),
+    });
+  }
+
+  private async attemptHistoryCompaction(
+    session: AgentSession,
+    compactionPlan: HistoryCompactionPlan,
+    contextLimit: number,
+  ): Promise<{ attempted: boolean; summaryStored: boolean }> {
+    if (!this.canSafelyAttemptCompactionRequest(compactionPlan.compactedMessages, contextLimit)) {
+      return { attempted: true, summaryStored: false };
+    }
+
+    const summary = await this.summarizeCompactedMessages(compactionPlan.compactedMessages);
+    const summaryStored = await this.persistCompactionSummary(session, summary);
+    session.replaceCompactedHistory(
+      buildCompactionSummaryMessage(summary),
+      compactionPlan.keepStartIndex,
+    );
+    return { attempted: true, summaryStored };
+  }
+
+  private canSafelyAttemptCompactionRequest(messages: InternalMessage[], contextLimit: number): boolean {
+    const requestBudget = createContextBudgetSnapshot({
+      contextLimit,
+      messageTokens: estimateMessagesTokens(buildCompactionRequestMessages(messages)),
+      toolDeclarationTokens: 0,
+    });
+
+    return !requestBudget.exceedsHardCeiling;
+  }
+
+  private async summarizeCompactedMessages(messages: InternalMessage[]): Promise<string> {
+    const { assistantText, toolCalls } = await this.collectProviderResponse(
+      buildCompactionRequestMessages(messages),
+      [],
+    );
+
+    if (toolCalls.length > 0) {
+      throw new Error("Context compaction summary unexpectedly returned tool calls.");
+    }
+
+    const summary = assistantText.trim();
+    if (summary === "") {
+      throw new Error("Context compaction summary was empty.");
+    }
+
+    return summary;
+  }
+
+  private async persistCompactionSummary(session: AgentSession, summary: string): Promise<boolean> {
+    try {
+      const storedAt = new Date().toISOString();
+      const result = await this.primitiveDispatcher.dispatch("memory", {
+        operation: "set",
+        domain: null,
+        key: `session_summary:${storedAt}`,
+        value: summary,
+      }, {
+        sessionId: session.id,
+        triggerSource: session.triggerSource,
+      });
+
+      return result.success;
+    } catch {
+      return false;
+    }
+  }
+
+  private async completeSessionForContextLimit(session: AgentSession, summaryStored: boolean): Promise<void> {
+    await this.sendNotification(
+      buildContextLimitNotice(session.triggerSource, summaryStored),
+      {
+        sessionId: session.id,
+        triggerSource: session.triggerSource,
+      },
+    );
+    this.sessionManager.completeSession(session.id);
+  }
+
+  private async collectProviderResponse(
+    messages: InternalMessage[],
+    tools: ToolDeclaration[],
+    options: { streamSessionId?: string } = {},
+  ): Promise<{ assistantText: string; toolCalls: ToolCall[] }> {
+    const assistantTextParts: string[] = [];
+    const toolCallsById = new Map<string, ToolCall>();
+    const toolCallOrder: string[] = [];
+
+    for await (const chunk of this.llmProvider.stream(messages, tools, this.modelConfig)) {
+      if (chunk.type === "text" && chunk.content) {
+        assistantTextParts.push(chunk.content);
+        if (options.streamSessionId) {
+          await this.sendStreamChunk(options.streamSessionId, chunk.content);
+        }
+        continue;
+      }
+
+      if (
+        (chunk.type === "tool_call_start"
+          || chunk.type === "tool_call_delta"
+          || chunk.type === "tool_call_end")
+        && chunk.toolCall
+      ) {
+        const toolCallKey = chunk.toolCallKey ?? chunk.toolCall.id;
+        const current = toolCallsById.get(toolCallKey) ?? {
+          id: chunk.toolCall.id,
+          name: "",
+          arguments: "",
+        };
+
+        if (!toolCallsById.has(toolCallKey)) {
+          toolCallOrder.push(toolCallKey);
+        }
+
+        current.id = chunk.toolCall.id;
+        current.name = chunk.toolCall.name;
+        current.arguments = chunk.toolCall.arguments;
+        toolCallsById.set(toolCallKey, current);
+      }
+    }
+
+    return {
+      assistantText: assistantTextParts.join(""),
+      toolCalls: toolCallOrder.map((toolCallId) => toolCallsById.get(toolCallId)).filter(Boolean) as ToolCall[],
+    };
   }
 
   private async sendStreamChunk(sessionId: string, content: string): Promise<void> {
@@ -765,4 +907,12 @@ function renderApprovalPromptContent(message: string): string {
   }
 
   return `${trimmedMessage} Reply exactly yes or no.`;
+}
+
+function buildContextLimitNotice(triggerSource: AgentSession["triggerSource"], summaryStored: boolean): string {
+  if (triggerSource === "schedule") {
+    return summaryStored ? TRIGGERED_CONTEXT_LIMIT_NOTICE : TRIGGERED_CONTEXT_LIMIT_NOTICE_NO_SUMMARY;
+  }
+
+  return summaryStored ? INTERACTIVE_CONTEXT_LIMIT_NOTICE : INTERACTIVE_CONTEXT_LIMIT_NOTICE_NO_SUMMARY;
 }

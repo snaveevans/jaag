@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { buildCompactionSummaryMessage } from "../context/budget.ts";
 import { SessionManager } from "./manager.ts";
 import { AgentSession } from "./session.ts";
 
@@ -60,6 +61,38 @@ describe("AgentSession", () => {
       operation: "messages.delete",
       now: new Date("2026-03-19T00:05:00.000Z"),
     })).toBe(false);
+  });
+
+  test("replaces older history with one summary system message and refreshes token accounting", () => {
+    const session = new AgentSession({
+      systemPrompt: "system prompt",
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+
+    session.appendUserMessage("first user");
+    session.appendAssistantMessage("first assistant");
+    session.appendToolResult("call-1", "tool result");
+    session.appendAssistantMessage("second assistant");
+    session.appendUserMessage("latest user");
+    session.appendAssistantMessage("latest assistant");
+
+    const before = session.getMessageTokenEstimate();
+
+    session.replaceCompactedHistory(
+      buildCompactionSummaryMessage("Earlier context."),
+      4,
+    );
+
+    expect(session.messages.map((message) => message.role)).toEqual([
+      "system",
+      "system",
+      "assistant",
+      "user",
+      "assistant",
+    ]);
+    expect(session.messages[1]?.content).toContain("Earlier context.");
+    expect(session.messages[2]?.content).toBe("second assistant");
+    expect(session.getMessageTokenEstimate()).toBeLessThan(before);
   });
 });
 

@@ -3,9 +3,22 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
+import {
+  buildCompactedMessageHistory,
+  buildCompactionRequestMessages,
+  buildCompactionSummaryMessage,
+  COMPACTION_TRIGGER_UTILIZATION,
+  estimateMessagesTokens,
+  estimateToolDeclarationsTokens,
+  HARD_CEILING_UTILIZATION,
+  planHistoryCompaction,
+} from "../context/budget.ts";
 import type { LLMProvider } from "../llm/provider.ts";
 import type { InternalMessage, ModelConfig, StreamChunk, ToolDeclaration } from "../llm/types.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
+import type { PrimitiveContext, PrimitiveResult } from "../primitives/types.ts";
+import type { TriggeredScheduleContext } from "../scheduler/types.ts";
+import { AgentSession } from "../session/session.ts";
 import { SessionManager } from "../session/manager.ts";
 import { buildMockBearerToolSpec, buildMockMutationToolSpec, buildMockOAuthToolSpec } from "../test/tool-spec-fixtures.ts";
 import { AgentRuntime } from "./agent.ts";
@@ -681,6 +694,73 @@ class ConcurrentTriggeredAskProvider implements LLMProvider {
 
     yield { type: "text", content: `Completed ${scheduleId}.` };
     yield { type: "done" };
+  }
+}
+
+class CompactionAwareProvider implements LLMProvider {
+  summaryCallCount = 0;
+  normalCallCount = 0;
+  summaryCallTools: ToolDeclaration[][] = [];
+
+  constructor(
+    private readonly summaryText: string,
+    private readonly normalText: string,
+  ) {}
+
+  async *stream(
+    _messages: InternalMessage[],
+    tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    if (tools.length === 0) {
+      this.summaryCallCount += 1;
+      this.summaryCallTools.push(tools);
+      yield { type: "text", content: this.summaryText };
+      yield { type: "done" };
+      return;
+    }
+
+    this.normalCallCount += 1;
+    yield { type: "text", content: this.normalText };
+    yield { type: "done" };
+  }
+}
+
+class SeededTriggeredSessionManager extends SessionManager {
+  constructor(
+    private readonly seedMessages: InternalMessage[],
+    options: ConstructorParameters<typeof SessionManager>[0],
+  ) {
+    super(options);
+  }
+
+  override createTriggeredSession(triggeredSchedule: TriggeredScheduleContext, now = new Date()): AgentSession {
+    const session = super.createTriggeredSession(triggeredSchedule, now);
+    seedSession(session, this.seedMessages);
+    return session;
+  }
+}
+
+class FailingSummaryMemoryDispatcher extends PrimitiveDispatcher {
+  override async dispatch(
+    primitiveName: string,
+    params: Record<string, unknown>,
+    context: PrimitiveContext,
+  ): Promise<PrimitiveResult> {
+    if (
+      primitiveName === "memory"
+      && params.operation === "set"
+      && params.domain === null
+      && typeof params.key === "string"
+      && params.key.startsWith("session_summary:")
+    ) {
+      return {
+        success: false,
+        error: "Injected compaction summary persistence failure.",
+      };
+    }
+
+    return await super.dispatch(primitiveName, params, context);
   }
 }
 
@@ -1679,6 +1759,445 @@ describe("AgentRuntime", () => {
       await runtime.shutdown(1000);
     }
   });
+
+  test("compacts interactive history, stores the summary in memory, and continues", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-compaction-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const dispatcher = new PrimitiveDispatcher({ agentHome, workspaceDir });
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    seedSession(session, buildSeedMessages());
+
+    const finalUserMessage = "latest request that should trigger compaction";
+    const futureMessages = [...session.messages, { role: "user", content: finalUserMessage } satisfies InternalMessage];
+    const compactionPlan = planHistoryCompaction(futureMessages);
+    expect(compactionPlan).not.toBeNull();
+
+    const summaryText = "Older repo and user context that still matters.";
+    const postCompactionMessages = buildCompactedMessageHistory(
+      futureMessages,
+      compactionPlan!.keepStartIndex,
+      buildCompactionSummaryMessage(summaryText),
+    );
+    const toolTokens = estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+    const preUsedTokens = estimateMessagesTokens(futureMessages) + toolTokens;
+    const postUsedTokens = estimateMessagesTokens(postCompactionMessages) + toolTokens;
+    const contextLimit = findContextLimit(preUsedTokens, postUsedTokens, "continue_after_compaction");
+
+    const provider = new CompactionAwareProvider(summaryText, "Compacted reply complete.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound(finalUserMessage);
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.summaryCallCount).toBe(1);
+    expect(provider.normalCallCount).toBe(1);
+    expect(provider.summaryCallTools[0]).toEqual([]);
+    expect(adapter.streamChunks).toEqual([
+      { sessionId: session.id, content: "Compacted reply complete." },
+    ]);
+
+    const activeSession = sessionManager.getInteractiveSession();
+    expect(activeSession).not.toBeNull();
+    expect(activeSession?.messages.filter((message) => message.role === "system" && message.content.includes("Runtime summary of earlier conversation"))).toHaveLength(1);
+    expect(activeSession?.messages[1]?.content).toContain(summaryText);
+    expect(activeSession?.messages.some((message) => message.content === "legacy user 1")).toBe(false);
+
+    const memoryEntries = await dispatcher.dispatch(
+      "memory",
+      {
+        operation: "list",
+        domain: null,
+      },
+      { sessionId: "memory-check" },
+    );
+    expect(memoryEntries).toMatchObject({
+      success: true,
+      data: {
+        entries: [
+          {
+            key: expect.stringMatching(/^session_summary:/),
+            value: summaryText,
+          },
+        ],
+      },
+    });
+  });
+
+  test("continues after compaction when summary persistence fails", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-compaction-persist-fail-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const dispatcher = new FailingSummaryMemoryDispatcher({ agentHome, workspaceDir });
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    seedSession(session, buildSeedMessages());
+
+    const finalUserMessage = "latest request that should still continue";
+    const futureMessages = [...session.messages, { role: "user", content: finalUserMessage } satisfies InternalMessage];
+    const compactionPlan = planHistoryCompaction(futureMessages);
+    expect(compactionPlan).not.toBeNull();
+
+    const summaryText = "Older repo and user context that still matters.";
+    const postCompactionMessages = buildCompactedMessageHistory(
+      futureMessages,
+      compactionPlan!.keepStartIndex,
+      buildCompactionSummaryMessage(summaryText),
+    );
+    const toolTokens = estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+    const preUsedTokens = estimateMessagesTokens(futureMessages) + toolTokens;
+    const postUsedTokens = estimateMessagesTokens(postCompactionMessages) + toolTokens;
+    const contextLimit = findContextLimit(preUsedTokens, postUsedTokens, "continue_after_compaction");
+
+    const provider = new CompactionAwareProvider(summaryText, "Compacted reply complete.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound(finalUserMessage);
+
+    try {
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.summaryCallCount).toBe(1);
+      expect(provider.normalCallCount).toBe(1);
+      expect(adapter.streamChunks).toEqual([
+        { sessionId: session.id, content: "Compacted reply complete." },
+      ]);
+      expect(adapter.sentMessages.some((message) => message.content.startsWith("Runtime error:"))).toBe(false);
+
+      const activeSession = sessionManager.getInteractiveSession();
+      expect(activeSession).not.toBeNull();
+      expect(activeSession?.messages.filter((message) => message.role === "system" && message.content.includes("Runtime summary of earlier conversation"))).toHaveLength(1);
+      expect(activeSession?.messages[1]?.content).toContain(summaryText);
+
+      const memoryEntries = await dispatcher.dispatch(
+        "memory",
+        {
+          operation: "list",
+          domain: null,
+        },
+        { sessionId: "memory-check" },
+      );
+      expect(memoryEntries).toMatchObject({
+        success: true,
+        data: {
+          entries: [],
+        },
+      });
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("allows an oversized first-turn interactive session to reach the model when nothing can be compacted", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-first-turn-oversized-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const dispatcher = new PrimitiveDispatcher({ agentHome, workspaceDir });
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const oversizedMessage = "first turn ".repeat(800);
+    const predictedSession = new AgentSession({ systemPrompt: "system prompt" });
+    predictedSession.appendUserMessage(oversizedMessage);
+    const contextLimit = predictedSession.getMessageTokenEstimate() + estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+
+    const provider = new CompactionAwareProvider("unused summary", "First turn still reached the model.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound(oversizedMessage);
+
+    try {
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.summaryCallCount).toBe(0);
+      expect(provider.normalCallCount).toBe(1);
+      expect(adapter.streamChunks).toEqual([
+        { sessionId: expect.any(String), content: "First turn still reached the model." },
+      ]);
+      expect(adapter.sentMessages.some((message) => message.content.includes("grown too large to continue safely"))).toBe(false);
+
+      const activeSession = sessionManager.getInteractiveSession();
+      expect(activeSession).not.toBeNull();
+      expect(activeSession?.messages.filter((message) => message.role === "user")).toHaveLength(1);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("ends cleanly without crashing when the compaction request itself cannot fit", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-compaction-request-too-large-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const dispatcher = new PrimitiveDispatcher({ agentHome, workspaceDir });
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    seedSession(session, buildLargeCompactionSeedMessages());
+
+    const finalUserMessage = "latest request that cannot be compacted safely";
+    const futureMessages = [...session.messages, { role: "user", content: finalUserMessage } satisfies InternalMessage];
+    const compactionPlan = planHistoryCompaction(futureMessages);
+    expect(compactionPlan).not.toBeNull();
+
+    const toolTokens = estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+    const preUsedTokens = estimateMessagesTokens(futureMessages) + toolTokens;
+    const compactionRequestTokens = estimateMessagesTokens(
+      buildCompactionRequestMessages(compactionPlan!.compactedMessages),
+    );
+    expect(compactionRequestTokens).toBeGreaterThan(1);
+
+    const contextLimit = Math.min(preUsedTokens, Math.max(1, Math.floor(compactionRequestTokens / HARD_CEILING_UTILIZATION) - 1));
+    const provider = new CompactionAwareProvider("This summary call should not happen.", "This normal call should not happen.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound(finalUserMessage);
+
+    try {
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.summaryCallCount).toBe(0);
+      expect(provider.normalCallCount).toBe(0);
+      expect(adapter.streamChunks).toEqual([]);
+      expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+        mode: "notify",
+        content: expect.stringContaining("I ended this session"),
+      }));
+      expect(adapter.sentMessages.some((message) => message.content.startsWith("Runtime error:"))).toBe(false);
+      expect(sessionManager.getInteractiveSession()).toBeNull();
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("ends an interactive session cleanly when utilization stays above the hard ceiling after compaction", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-hard-ceiling-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const dispatcher = new PrimitiveDispatcher({ agentHome, workspaceDir });
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    seedSession(session, buildSeedMessages());
+
+    const finalUserMessage = "latest request that should hard stop";
+    const futureMessages = [...session.messages, { role: "user", content: finalUserMessage } satisfies InternalMessage];
+    const compactionPlan = planHistoryCompaction(futureMessages);
+    expect(compactionPlan).not.toBeNull();
+
+    const summaryText = "summary ".repeat(120).trim();
+    const postCompactionMessages = buildCompactedMessageHistory(
+      futureMessages,
+      compactionPlan!.keepStartIndex,
+      buildCompactionSummaryMessage(summaryText),
+    );
+    const toolTokens = estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+    const preUsedTokens = estimateMessagesTokens(futureMessages) + toolTokens;
+    const postUsedTokens = estimateMessagesTokens(postCompactionMessages) + toolTokens;
+    const compactionRequestTokens = estimateMessagesTokens(
+      buildCompactionRequestMessages(compactionPlan!.compactedMessages),
+    );
+    const contextLimit = findContextLimit(preUsedTokens, postUsedTokens, "hard_ceiling_after_compaction", {
+      minimumContextLimit: Math.ceil(compactionRequestTokens / HARD_CEILING_UTILIZATION),
+    });
+
+    const provider = new CompactionAwareProvider(summaryText, "This should never stream.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+    adapter.dispatchInbound(finalUserMessage);
+
+    expect(await runtime.waitForIdle(1000)).toBe(true);
+    expect(provider.summaryCallCount).toBe(1);
+    expect(provider.normalCallCount).toBe(0);
+    expect(adapter.streamChunks).toEqual([]);
+    expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+      mode: "notify",
+      content: expect.stringContaining("stored a summary in memory and ended this session"),
+    }));
+    expect(sessionManager.getInteractiveSession()).toBeNull();
+
+    const memoryEntries = await dispatcher.dispatch(
+      "memory",
+      {
+        operation: "list",
+        domain: null,
+      },
+      { sessionId: "memory-check" },
+    );
+    expect(memoryEntries).toMatchObject({
+      success: true,
+      data: {
+        entries: [
+          {
+            key: expect.stringMatching(/^session_summary:/),
+            value: summaryText,
+          },
+        ],
+      },
+    });
+  });
+
+  test("ends triggered sessions successfully when utilization stays above the hard ceiling after compaction", async () => {
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-triggered-hard-ceiling-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    const dispatcher = new PrimitiveDispatcher({ agentHome, workspaceDir });
+    const seedMessages = buildSeedMessages();
+    const schedule = {
+      schedule_id: "schedule-context-limit",
+      workflow: "hydration",
+      group: null,
+      trigger: { type: "once", at: "2026-03-22T10:00:00.000Z" },
+      context: { instruction: "Continue the scheduled work." },
+      instruction: "Continue the scheduled work.",
+    } satisfies TriggeredScheduleContext;
+    const now = new Date("2026-03-22T10:00:00.000Z");
+
+    const predictedSession = new AgentSession({
+      systemPrompt: buildTriggeredSystemPrompt(now, schedule),
+      triggerSource: "schedule",
+      createdAt: now,
+    });
+    seedSession(predictedSession, seedMessages);
+    const compactionPlan = planHistoryCompaction(predictedSession.messages);
+    expect(compactionPlan).not.toBeNull();
+
+    const summaryText = "scheduled summary ".repeat(120).trim();
+    const postCompactionMessages = buildCompactedMessageHistory(
+      predictedSession.messages,
+      compactionPlan!.keepStartIndex,
+      buildCompactionSummaryMessage(summaryText),
+    );
+    const toolTokens = estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+    const preUsedTokens = estimateMessagesTokens(predictedSession.messages) + toolTokens;
+    const postUsedTokens = estimateMessagesTokens(postCompactionMessages) + toolTokens;
+    const compactionRequestTokens = estimateMessagesTokens(
+      buildCompactionRequestMessages(compactionPlan!.compactedMessages),
+    );
+    const contextLimit = findContextLimit(preUsedTokens, postUsedTokens, "hard_ceiling_after_compaction", {
+      minimumContextLimit: Math.ceil(compactionRequestTokens / HARD_CEILING_UTILIZATION),
+    });
+
+    const provider = new CompactionAwareProvider(summaryText, "This should never stream.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager: new SeededTriggeredSessionManager(seedMessages, {
+        buildSystemPrompt: ({ now: runtimeNow, triggeredSchedule }) => buildTriggeredSystemPrompt(runtimeNow, triggeredSchedule),
+      }),
+      primitiveDispatcher: dispatcher,
+    });
+
+    runtime.start();
+
+    try {
+      expect(await runtime.launchTriggeredSchedule(schedule, now)).toBe(true);
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.summaryCallCount).toBe(1);
+      expect(provider.normalCallCount).toBe(0);
+      expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+        mode: "notify",
+        content: expect.stringContaining("Scheduled session ended because it stayed above the context hard ceiling"),
+      }));
+
+      const memoryEntries = await dispatcher.dispatch(
+        "memory",
+        {
+          operation: "list",
+          domain: null,
+        },
+        { sessionId: "memory-check" },
+      );
+      expect(memoryEntries).toMatchObject({
+        success: true,
+        data: {
+          entries: [
+            {
+              key: expect.stringMatching(/^session_summary:/),
+              value: summaryText,
+            },
+          ],
+        },
+      });
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
 });
 
 async function waitForCondition(
@@ -1712,4 +2231,94 @@ function buildTriggeredSystemPrompt(now: Date, triggeredSchedule: { schedule_id:
 
 function extractScheduleId(systemPrompt: string): string {
   return systemPrompt.match(/schedule_id: (.+)/)?.[1] ?? "unknown";
+}
+
+function createModelConfig(overrides: Partial<ModelConfig> = {}): ModelConfig {
+  return {
+    model: "fake-model",
+    baseUrl: "http://localhost",
+    temperature: 0,
+    maxOutputTokens: 128,
+    apiKey: "test-key",
+    ...overrides,
+  } satisfies ModelConfig;
+}
+
+function buildSeedMessages(): InternalMessage[] {
+  return [
+    { role: "user", content: "legacy user 1" },
+    { role: "assistant", content: "legacy assistant 1" },
+    { role: "tool_result", content: '{"success":true,"data":"legacy tool 1"}', toolResultId: "legacy-call-1" },
+    { role: "assistant", content: "legacy assistant 2" },
+    { role: "user", content: "legacy user 2" },
+    { role: "assistant", content: "legacy assistant 3" },
+    { role: "tool_result", content: '{"success":true,"data":"legacy tool 2"}', toolResultId: "legacy-call-2" },
+    { role: "assistant", content: "legacy assistant 4" },
+    { role: "user", content: "legacy user 3" },
+    { role: "assistant", content: "legacy assistant 5" },
+  ];
+}
+
+function buildLargeCompactionSeedMessages(): InternalMessage[] {
+  const largeChunk = "older context ".repeat(700);
+
+  return [
+    { role: "user", content: `${largeChunk}legacy user 1` },
+    { role: "assistant", content: `${largeChunk}legacy assistant 1` },
+    { role: "tool_result", content: `{"success":true,"data":"${largeChunk}legacy tool 1"}`, toolResultId: "legacy-call-1" },
+    { role: "assistant", content: `${largeChunk}legacy assistant 2` },
+    { role: "user", content: `${largeChunk}legacy user 2` },
+    { role: "assistant", content: "recent assistant 1" },
+    { role: "tool_result", content: '{"success":true,"data":"recent tool 1"}', toolResultId: "legacy-call-2" },
+    { role: "assistant", content: "recent assistant 2" },
+    { role: "user", content: "recent user 3" },
+    { role: "assistant", content: "recent assistant 3" },
+  ];
+}
+
+function seedSession(session: AgentSession, messages: InternalMessage[]): void {
+  for (const message of messages) {
+    switch (message.role) {
+      case "user":
+        session.appendUserMessage(message.content);
+        break;
+      case "assistant":
+        session.appendAssistantMessage(message.content, message.toolCalls);
+        break;
+      case "system":
+        session.appendSystemMessage(message.content);
+        break;
+      case "tool_result":
+        session.appendToolResult(message.toolResultId ?? crypto.randomUUID(), message.content);
+        break;
+    }
+  }
+}
+
+function findContextLimit(
+  preUsedTokens: number,
+  postUsedTokens: number,
+  mode: "continue_after_compaction" | "hard_ceiling_after_compaction",
+  options: { minimumContextLimit?: number } = {},
+): number {
+  const minimumContextLimit = Math.max(1, Math.trunc(options.minimumContextLimit ?? 1));
+
+  for (let contextLimit = minimumContextLimit; contextLimit <= Math.max(preUsedTokens, postUsedTokens) + 1_000; contextLimit += 1) {
+    const preUtilization = preUsedTokens / contextLimit;
+    const postUtilization = postUsedTokens / contextLimit;
+
+    if (preUtilization < COMPACTION_TRIGGER_UTILIZATION) {
+      continue;
+    }
+
+    if (mode === "continue_after_compaction" && postUtilization < HARD_CEILING_UTILIZATION) {
+      return contextLimit;
+    }
+
+    if (mode === "hard_ceiling_after_compaction" && postUtilization > HARD_CEILING_UTILIZATION) {
+      return contextLimit;
+    }
+  }
+
+  throw new Error(`Unable to find a context limit for ${mode}.`);
 }

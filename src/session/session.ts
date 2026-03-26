@@ -1,5 +1,10 @@
 import type { InternalMessage, ToolCall } from "../llm/types.ts";
 import {
+  buildCompactedMessageHistory,
+  estimateMessageTokens,
+  estimateMessagesTokens,
+} from "../context/budget.ts";
+import {
   findMatchingApprovalReceipt,
   type ApprovalReceipt,
   type ApprovalReceiptCriteria,
@@ -34,6 +39,7 @@ export class AgentSession {
   iterationCount: number;
   readonly inactivityTimeoutMs: number;
   readonly maxIterations: number;
+  private messageTokenEstimate: number;
 
   constructor(options: AgentSessionOptions) {
     const createdAt = options.createdAt ?? new Date();
@@ -48,37 +54,45 @@ export class AgentSession {
     this.iterationCount = 0;
     this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 10 * 60 * 1000;
     this.maxIterations = options.maxIterations ?? 50;
+    this.messageTokenEstimate = estimateMessagesTokens(this.messages);
   }
 
   appendUserMessage(content: string, at = new Date()): void {
-    this.messages.push({ role: "user", content });
-    this.status = "active";
-    this.touch(at);
+    this.appendMessage({ role: "user", content }, at);
   }
 
   appendAssistantMessage(content: string, toolCalls?: ToolCall[], at = new Date()): void {
-    this.messages.push({
+    this.appendMessage({
       role: "assistant",
       content,
       ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
-    });
-    this.status = "active";
-    this.touch(at);
+    }, at);
   }
 
   appendSystemMessage(content: string, at = new Date()): void {
-    this.messages.push({ role: "system", content });
-    this.status = "active";
-    this.touch(at);
+    this.appendMessage({ role: "system", content }, at);
   }
 
   appendToolResult(toolResultId: string, content: string, at = new Date()): void {
-    this.messages.push({
+    this.appendMessage({
       role: "tool_result",
       content,
       toolResultId,
-    });
-    this.status = "active";
+    }, at);
+  }
+
+  getMessageTokenEstimate(): number {
+    return this.messageTokenEstimate;
+  }
+
+  replaceCompactedHistory(summaryMessage: string, keepStartIndex: number, at = new Date()): void {
+    if (keepStartIndex <= 1) {
+      return;
+    }
+
+    const nextMessages = buildCompactedMessageHistory(this.messages, keepStartIndex, summaryMessage);
+    this.messages.splice(0, this.messages.length, ...nextMessages);
+    this.messageTokenEstimate = estimateMessagesTokens(this.messages);
     this.touch(at);
   }
 
@@ -130,6 +144,13 @@ export class AgentSession {
 
   markFailed(at = new Date()): void {
     this.status = "failed";
+    this.touch(at);
+  }
+
+  private appendMessage(message: InternalMessage, at: Date): void {
+    this.messages.push(message);
+    this.messageTokenEstimate += estimateMessageTokens(message);
+    this.status = "active";
     this.touch(at);
   }
 

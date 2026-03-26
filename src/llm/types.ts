@@ -23,6 +23,7 @@ export interface ModelConfig {
   baseUrl: string;
   temperature: number;
   maxOutputTokens: number;
+  contextLimit?: number;
   apiKey: string;
 }
 
