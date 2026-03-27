@@ -30,6 +30,7 @@ export function initializeDatabase(options: DatabaseOptions = {}): Database {
   });
 
   database.run("PRAGMA journal_mode = WAL");
+  verifyDatabaseIntegrity(database);
   runDatabaseMigrations(database);
   return database;
 }
@@ -50,4 +51,15 @@ export function closeDatabase(): void {
   sharedDatabase?.close(false);
   sharedDatabase = null;
   sharedDatabasePath = null;
+}
+
+export function verifyDatabaseIntegrity(database: Database): void {
+  const results = database.query<{ integrity_check: string }, []>("PRAGMA integrity_check").all();
+  const messages = results.map((row) => row.integrity_check.trim()).filter((value) => value !== "");
+
+  if (messages.length === 1 && messages[0]?.toLowerCase() === "ok") {
+    return;
+  }
+
+  throw new Error(`SQLite integrity check failed: ${messages.join("; ") || "unknown corruption detected"}.`);
 }

@@ -9,6 +9,7 @@ export interface SystemPromptOptions {
   toolManifests?: ToolManifest[];
   policySummary?: string;
   triggeredSchedule?: TriggeredScheduleContext;
+  continuityBlock?: string | null;
 }
 
 export function buildBaseSystemPrompt(options: SystemPromptOptions = {}): string {
@@ -49,6 +50,7 @@ export function buildBaseSystemPrompt(options: SystemPromptOptions = {}): string
     options.policySummary ? `Policy summary: ${options.policySummary}` : null,
     `Current time: ${now.toISOString()}`,
     `Runtime timezone: ${timeZone}`,
+    options.continuityBlock,
     triggeredSchedule,
     "Available primitive functions:",
     primitiveList,

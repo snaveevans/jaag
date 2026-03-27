@@ -3,7 +3,7 @@ import type { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initializeDatabase, resolveDatabasePath } from "./database.ts";
+import { initializeDatabase, resolveDatabasePath, verifyDatabaseIntegrity } from "./database.ts";
 
 const databases: Database[] = [];
 const tempDirs: string[] = [];
@@ -92,6 +92,23 @@ describe("initializeDatabase", () => {
     );
     const scheduleCount = database.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM schedules").get();
     expect(scheduleCount?.count).toBe(1);
+  });
+
+  test("throws a clear startup error when integrity_check is not ok", async () => {
+    const homeDir = await createHomeDir();
+    const agentHome = join(homeDir, ".agent");
+    const database = initializeDatabase({ agentHome });
+    databases.push(database);
+
+    expect(() => verifyDatabaseIntegrity({
+      query: () => ({
+        all: () => [
+          { integrity_check: "*** in database main ***\nPage 3 is never used" },
+        ],
+      }),
+    } as unknown as Database)).toThrow(
+      "SQLite integrity check failed: *** in database main ***\nPage 3 is never used.",
+    );
   });
 });
 

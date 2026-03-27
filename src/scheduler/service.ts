@@ -36,6 +36,7 @@ export class SchedulerService {
     }
 
     this.stopping = false;
+    this.store.reconcileInterruptedExecutions(this.now());
     await this.runTick();
     this.intervalHandle = this.setIntervalFn(() => {
       void this.runTick();

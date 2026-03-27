@@ -136,8 +136,8 @@ export class AgentRuntime {
       return Promise.resolve(false);
     }
 
-    const session = this.sessionManager.createTriggeredSession(schedule, firedAt);
-    const task = this.runTriggeredSession(session);
+    const task = this.sessionManager.createTriggeredSession(schedule, firedAt)
+      .then(async (session) => await this.runTriggeredSession(session));
     this.activeBackgroundTasks.add(task);
     void task.finally(() => {
       this.activeBackgroundTasks.delete(task);
@@ -165,7 +165,7 @@ export class AgentRuntime {
         return;
       }
 
-      const session = this.sessionManager.getOrCreateInteractiveSession(inbound.timestamp);
+      const session = await this.sessionManager.getOrCreateInteractiveSession(inbound.timestamp);
       try {
         await this.processSession(session, {
           initialUserMessage: inbound,

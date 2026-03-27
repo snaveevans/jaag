@@ -8,9 +8,9 @@ import { SchedulerService } from "./scheduler/service.ts";
 import { SessionManager } from "./session/manager.ts";
 import { AgentRuntime } from "./runtime/agent.ts";
 import { acquirePidFile } from "./runtime/pid.ts";
-import { buildBaseSystemPrompt } from "./runtime/system-prompt.ts";
 import { closeDatabase, getDatabase } from "./db/database.ts";
 import { resolveExecuteWorkspaceDir } from "./config/schema.ts";
+import { createContinuityAwareSystemPromptBuilder } from "./continuity/prompt.ts";
 
 async function main(): Promise<void> {
   const agentHome = resolveAgentHome();
@@ -42,7 +42,7 @@ async function main(): Promise<void> {
 
   try {
     const config = await loadConfig();
-    getDatabase({ agentHome: config.agentHome });
+    const database = getDatabase({ agentHome: config.agentHome });
     const executeWorkspaceDir = resolveExecuteWorkspaceDir(config.agentHome);
     await mkdir(executeWorkspaceDir, { recursive: true });
     const primitiveDispatcher = new PrimitiveDispatcher({
@@ -61,12 +61,11 @@ async function main(): Promise<void> {
       llmProvider: new OpenAICompatibleProvider(),
       modelConfig: config.llm,
       sessionManager: new SessionManager({
-        buildSystemPrompt: ({ now, triggeredSchedule }) => buildBaseSystemPrompt({
-          now,
-          policySummary: primitiveDispatcher.getPolicySummary(),
+        buildSystemPrompt: createContinuityAwareSystemPromptBuilder({
+          getDatabase: () => database,
+          getPolicySummary: () => primitiveDispatcher.getPolicySummary(),
+          getToolManifests: () => primitiveDispatcher.listToolManifests(),
           timeZone: config.runtime.timezone,
-          toolManifests: primitiveDispatcher.listToolManifests(),
-          triggeredSchedule,
         }),
       }),
       primitiveDispatcher,
@@ -75,7 +74,7 @@ async function main(): Promise<void> {
 
     scheduler = new SchedulerService({
       store: new ScheduleStore({
-        database: getDatabase({ agentHome: config.agentHome }),
+        database,
         timeZone: config.runtime.timezone,
       }),
       launchSchedule: async (schedule, firedAt) => await runtime!.launchTriggeredSchedule(schedule, firedAt),

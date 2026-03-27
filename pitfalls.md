@@ -2,6 +2,110 @@
 
 This file is a running log of small-but-annoying issues we've hit, plus the fix that worked.
 
+## 2026-03-25 - Async session bootstrap refactors require updating both local vars and sync test call sites
+
+### Symptom
+
+- While making `SessionManager` support async system-prompt building, the first typecheck pass failed because `src/session/manager.ts` referenced `now` inside a helper where only `input.now` existed.
+- Related tests and runtime subclasses also broke until all `getOrCreateInteractiveSession(...)` / `createTriggeredSession(...)` call sites were updated to `await` the new Promise-based API.
+
+### Cause
+
+- The refactor moved prompt construction into an async helper but left behind one stale variable reference from the old synchronous implementation.
+- The API shape changed from sync to async, but several tests and one subclass still assumed immediate `AgentSession` returns.
+
+### Fix
+
+- In `src/session/manager.ts`, pass `now: input.now` through the async helper instead of referencing a non-existent local variable.
+- Update all affected callers and overrides to `await` the async session methods, including `src/runtime/agent.ts`, `src/session/session.test.ts`, and `src/runtime/agent.test.ts`.
+
+### How to avoid next time
+
+- When lifting sync construction into an async helper, do a quick pass for stale locals copied from the old scope before running typecheck.
+- After changing a manager API from sync to async, grep every call site and test override immediately instead of relying on incremental compile errors.
+
+### Evidence (optional)
+
+- Validation after the fix: `bun run typecheck`; `bun test`
+
+## 2026-03-25 - Compaction budget guards need realistic minimum context limits in hard-ceiling tests
+
+### Symptom
+
+- A follow-up Slice 07b runtime patch added a pre-check for the compaction-summary provider call, then `bun test src/runtime/agent.test.ts` failed twice because the existing hard-ceiling compaction tests stopped seeing any summary call (`Expected: 1, Received: 0`).
+
+### Cause
+
+- The helper that searched for a matching `contextLimit` started at `1`, which let the hard-ceiling tests pick an unrealistically tiny limit even though the intended path was "compaction is attempted, then the session still ends above 90%."
+- Once the runtime became budget-aware about the compaction request itself, those tiny limits correctly skipped the summary call, so the old test setup no longer matched the scenario it claimed to cover.
+
+### Fix
+
+- Keep the runtime guard aligned to the existing hard-ceiling heuristic (`> 90%` means unsafe for the compaction request).
+- In `src/runtime/agent.test.ts`, update the hard-ceiling context-limit helper call sites to pass a realistic `minimumContextLimit` derived from the compaction-request token estimate.
+- Leave a separate regression for the truly-too-large compaction-request path instead of overloading the existing happy-path hard-ceiling tests.
+
+### How to avoid next time
+
+- When adding budget-aware guards around a provider sub-call, re-check any tests that derive synthetic limits with brute-force helper loops; they may accidentally rely on impossible limits.
+- For compaction-path tests, make the chosen `contextLimit` satisfy both the outer session condition and the inner compaction-request condition.
+
+### Evidence (optional)
+
+- Validation after the fix: `bun test src/runtime/agent.test.ts`; `bun test`; `bun run typecheck`
+
+## 2026-03-25 - Compaction heuristic tests should use explicit window math and simple expectations
+
+### Symptom
+
+- A first-pass Slice 07b test patch failed `bun run typecheck` because one new expectation had an extra closing parenthesis and another used a contrived string expression for an expected role literal.
+- The follow-up `bun test` run still failed because the new compaction heuristic test expected `keepStartIndex` 4 when the implemented "keep the larger of the last N messages or the latest user exchange" rule correctly produced 5.
+
+### Cause
+
+- I hand-authored a long expectation chain without simplifying it first, which made a small punctuation mistake easy to miss.
+- I also miscounted the kept trailing window when converting the documented heuristic into a concrete assertion.
+
+### Fix
+
+- Replace clever/string-generated expected values with direct literals in `src/context/budget.test.ts`.
+- Fix the malformed expectation in `src/runtime/agent.test.ts`.
+- Recalculate the expected compaction window explicitly: with 11 total messages and a keep window of 6, the last-window start index is 5, so messages before that index are the compacted span.
+
+### How to avoid next time
+
+- For heuristic tests, write out the concrete index math from the current fixture before locking the assertion.
+- Keep expected-role arrays and boolean assertions literal and boring; avoid clever expressions in test expectations.
+- When a large patch adds multiple new tests, run `bun run typecheck` before the full suite so syntax mistakes surface faster.
+
+### Evidence (optional)
+
+- Validation after the fix: `bun run typecheck`; `bun test`
+
+## 2026-03-25 - Verify numbered implementation doc filenames before reading adjacent slices
+
+### Symptom
+
+- While splitting `docs/implementation/07-hardening.md`, a read against `docs/implementation/06-reliability.md` failed with `File not found`.
+
+### Cause
+
+- I inferred the neighboring slice filename from the topic instead of verifying the actual filenames in `docs/implementation/`.
+
+### Fix
+
+- Run a file-name check first (`glob` over `docs/implementation/*.md`) and then read the actual adjacent docs that exist.
+- In this repo, the correct nearby references were `docs/implementation/05-scheduling.md` and `docs/implementation/06-execute.md`.
+
+### How to avoid next time
+
+- When a repo uses numbered slice docs, verify the exact filenames before reading “the previous slice” by guessed name.
+- Prefer a quick glob over assuming that topic names line up with slice numbers.
+
+### Evidence (optional)
+
+- Error observed while preparing the Slice 07 doc split; resolved by checking `docs/implementation/*.md` and switching to the real filenames.
+
 ## 2026-03-25 - OpenAI-compatible tool-call turns must not send empty assistant content
 
 ### Symptom

@@ -734,8 +734,8 @@ class SeededTriggeredSessionManager extends SessionManager {
     super(options);
   }
 
-  override createTriggeredSession(triggeredSchedule: TriggeredScheduleContext, now = new Date()): AgentSession {
-    const session = super.createTriggeredSession(triggeredSchedule, now);
+  override async createTriggeredSession(triggeredSchedule: TriggeredScheduleContext, now = new Date()): Promise<AgentSession> {
+    const session = await super.createTriggeredSession(triggeredSchedule, now);
     seedSession(session, this.seedMessages);
     return session;
   }
@@ -1774,7 +1774,7 @@ describe("AgentRuntime", () => {
     const sessionManager = new SessionManager({
       buildSystemPrompt: () => "system prompt",
     });
-    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    const session = await sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
     seedSession(session, buildSeedMessages());
 
     const finalUserMessage = "latest request that should trigger compaction";
@@ -1854,7 +1854,7 @@ describe("AgentRuntime", () => {
     const sessionManager = new SessionManager({
       buildSystemPrompt: () => "system prompt",
     });
-    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    const session = await sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
     seedSession(session, buildSeedMessages());
 
     const finalUserMessage = "latest request that should still continue";
@@ -1980,7 +1980,7 @@ describe("AgentRuntime", () => {
     const sessionManager = new SessionManager({
       buildSystemPrompt: () => "system prompt",
     });
-    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    const session = await sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
     seedSession(session, buildLargeCompactionSeedMessages());
 
     const finalUserMessage = "latest request that cannot be compacted safely";
@@ -2038,7 +2038,7 @@ describe("AgentRuntime", () => {
     const sessionManager = new SessionManager({
       buildSystemPrompt: () => "system prompt",
     });
-    const session = sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    const session = await sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
     seedSession(session, buildSeedMessages());
 
     const finalUserMessage = "latest request that should hard stop";

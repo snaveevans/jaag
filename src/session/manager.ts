@@ -10,15 +10,16 @@ export interface BuildSystemPromptInput {
 export interface SessionManagerOptions {
   inactivityTimeoutMs?: number;
   maxIterations?: number;
-  buildSystemPrompt?: (input: BuildSystemPromptInput) => string;
+  buildSystemPrompt?: (input: BuildSystemPromptInput) => string | Promise<string>;
 }
 
 export class SessionManager {
   private readonly sessions = new Map<string, AgentSession>();
   private interactiveSessionId: string | null = null;
+  private pendingInteractiveSession: Promise<AgentSession> | null = null;
   private readonly inactivityTimeoutMs: number;
   private readonly maxIterations: number;
-  private readonly buildSystemPrompt: (input: BuildSystemPromptInput) => string;
+  private readonly buildSystemPrompt: (input: BuildSystemPromptInput) => string | Promise<string>;
 
   constructor(options: SessionManagerOptions) {
     this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 10 * 60 * 1000;
@@ -26,7 +27,7 @@ export class SessionManager {
     this.buildSystemPrompt = options.buildSystemPrompt ?? (() => "You are a local agent daemon.");
   }
 
-  getOrCreateInteractiveSession(now = new Date()): AgentSession {
+  async getOrCreateInteractiveSession(now = new Date()): Promise<AgentSession> {
     this.cleanupExpiredSessions(now);
 
     const current = this.getInteractiveSession();
@@ -34,33 +35,33 @@ export class SessionManager {
       return current;
     }
 
-    const session = new AgentSession({
-      systemPrompt: this.buildSystemPrompt({
-        now,
-        triggerSource: "user",
-      }),
-      triggerSource: "user",
-      createdAt: now,
-      inactivityTimeoutMs: this.inactivityTimeoutMs,
-      maxIterations: this.maxIterations,
-    });
+    if (this.pendingInteractiveSession) {
+      return await this.pendingInteractiveSession;
+    }
 
-    this.sessions.set(session.id, session);
-    this.interactiveSessionId = session.id;
-    return session;
+    const pendingSession = this.createSession({
+      now,
+      triggerSource: "user",
+    });
+    this.pendingInteractiveSession = pendingSession;
+
+    try {
+      const session = await pendingSession;
+      this.sessions.set(session.id, session);
+      this.interactiveSessionId = session.id;
+      return session;
+    } finally {
+      if (this.pendingInteractiveSession === pendingSession) {
+        this.pendingInteractiveSession = null;
+      }
+    }
   }
 
-  createTriggeredSession(triggeredSchedule: TriggeredScheduleContext, now = new Date()): AgentSession {
-    const session = new AgentSession({
-      systemPrompt: this.buildSystemPrompt({
-        now,
-        triggerSource: "schedule",
-        triggeredSchedule,
-      }),
+  async createTriggeredSession(triggeredSchedule: TriggeredScheduleContext, now = new Date()): Promise<AgentSession> {
+    const session = await this.createSession({
+      now,
       triggerSource: "schedule",
-      createdAt: now,
-      inactivityTimeoutMs: this.inactivityTimeoutMs,
-      maxIterations: this.maxIterations,
+      triggeredSchedule,
     });
 
     this.sessions.set(session.id, session);
@@ -123,6 +124,20 @@ export class SessionManager {
       session.markCompleted(now);
       this.pruneSession(session.id);
     }
+  }
+
+  private async createSession(input: BuildSystemPromptInput): Promise<AgentSession> {
+    return new AgentSession({
+      systemPrompt: await this.buildSystemPrompt({
+        now: input.now,
+        triggerSource: input.triggerSource,
+        triggeredSchedule: input.triggeredSchedule,
+      }),
+      triggerSource: input.triggerSource,
+      createdAt: input.now,
+      inactivityTimeoutMs: this.inactivityTimeoutMs,
+      maxIterations: this.maxIterations,
+    });
   }
 
   private pruneSession(sessionId: string): void {

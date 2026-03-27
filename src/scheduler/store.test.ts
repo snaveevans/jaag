@@ -82,6 +82,50 @@ describe("ScheduleStore.update", () => {
       next_fire_at: "2026-03-21T10:10:00.000Z",
     });
   });
+
+  test("reconciles interrupted executions using the existing last_fire_status schema", () => {
+    let currentTime = new Date("2026-03-21T10:20:00.000Z");
+    const store = createStore(() => currentTime);
+
+    const interrupted = store.create({
+      workflow: "hydration",
+      context: { instruction: "Send a hydration reminder." },
+      trigger: {
+        type: "cron",
+        expression: "*/5 * * * *",
+        cron: "*/5 * * * *",
+      },
+    });
+    const untouched = store.create({
+      workflow: "stretch",
+      context: { instruction: "Tell the user to stretch." },
+      trigger: {
+        type: "once",
+        at: "2026-03-21T11:00:00.000Z",
+      },
+    });
+
+    store.advanceForExecution(interrupted.schedule_id, new Date("2026-03-21T10:25:00.000Z"));
+    expect(store.getById(interrupted.schedule_id)).toMatchObject({
+      last_fired_at: "2026-03-21T10:25:00.000Z",
+      last_fire_status: null,
+    });
+
+    currentTime = new Date("2026-03-21T10:30:00.000Z");
+
+    const changed = store.reconcileInterruptedExecutions(currentTime);
+
+    expect(changed).toBe(1);
+    expect(store.getById(interrupted.schedule_id)).toMatchObject({
+      last_fired_at: "2026-03-21T10:25:00.000Z",
+      last_fire_status: "failed",
+      updated_at: "2026-03-21T10:30:00.000Z",
+    });
+    expect(store.getById(untouched.schedule_id)).toMatchObject({
+      last_fired_at: null,
+      last_fire_status: null,
+    });
+  });
 });
 
 function createStore(now: () => Date): ScheduleStore {

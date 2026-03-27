@@ -324,6 +324,48 @@ describe("SchedulerService", () => {
       await runtime.shutdown(1_000);
     }
   });
+
+  test("reconciles interrupted schedules on startup before normal ticking", async () => {
+    let currentTime = new Date("2026-03-21T10:20:00.000Z");
+    const store = createStore(() => currentTime);
+    const created = store.create({
+      workflow: "hydration",
+      context: { instruction: "Send a hydration reminder." },
+      trigger: {
+        type: "cron",
+        expression: "*/5 * * * *",
+        cron: "*/5 * * * *",
+      },
+    });
+
+    store.advanceForExecution(created.schedule_id, new Date("2026-03-21T10:25:00.000Z"));
+    expect(store.getById(created.schedule_id)?.last_fire_status).toBeNull();
+
+    currentTime = new Date("2026-03-21T10:30:00.000Z");
+
+    const launchedIds: string[] = [];
+    const service = new SchedulerService({
+      store,
+      now: () => currentTime,
+      tickIntervalMs: 60_000,
+      launchSchedule: async (schedule) => {
+        launchedIds.push(schedule.schedule_id);
+        return true;
+      },
+    });
+
+    await service.start();
+    await Bun.sleep(0);
+    await service.stop();
+
+    expect(launchedIds).toEqual([created.schedule_id]);
+    expect(store.getById(created.schedule_id)).toMatchObject({
+      last_fired_at: "2026-03-21T10:30:00.000Z",
+      last_fire_status: "success",
+      fire_count: 2,
+      next_fire_at: "2026-03-21T10:35:00.000Z",
+    });
+  });
 });
 
 function createStore(now: () => Date): ScheduleStore {

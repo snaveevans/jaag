@@ -97,15 +97,15 @@ describe("AgentSession", () => {
 });
 
 describe("SessionManager", () => {
-  test("reuses one interactive session until timeout", () => {
+  test("reuses one interactive session until timeout", async () => {
     const manager = new SessionManager({
       inactivityTimeoutMs: 60_000,
       buildSystemPrompt: () => "prompt",
     });
 
-    const first = manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:00:00.000Z"));
-    const second = manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:00:30.000Z"));
-    const third = manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:02:00.000Z"));
+    const first = await manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:00:00.000Z"));
+    const second = await manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:00:30.000Z"));
+    const third = await manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:02:00.000Z"));
 
     expect(second.id).toBe(first.id);
     expect(third.id).not.toBe(first.id);
@@ -113,19 +113,19 @@ describe("SessionManager", () => {
     expect(manager.listSessions()).toHaveLength(1);
   });
 
-  test("prunes completed and failed sessions from memory", () => {
+  test("prunes completed and failed sessions from memory", async () => {
     const manager = new SessionManager({
       buildSystemPrompt: () => "prompt",
     });
 
-    const completed = manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:00:00.000Z"));
+    const completed = await manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:00:00.000Z"));
     manager.completeSession(completed.id, new Date("2026-03-19T00:00:01.000Z"));
 
     expect(manager.getInteractiveSession()).toBeNull();
     expect(manager.getSession(completed.id)).toBeUndefined();
     expect(manager.listSessions()).toHaveLength(0);
 
-    const failed = manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:01:00.000Z"));
+    const failed = await manager.getOrCreateInteractiveSession(new Date("2026-03-19T00:01:00.000Z"));
     manager.failSession(failed.id, new Date("2026-03-19T00:01:01.000Z"));
 
     expect(manager.getInteractiveSession()).toBeNull();

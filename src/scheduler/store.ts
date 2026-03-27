@@ -327,6 +327,19 @@ export class ScheduleStore {
       [executionStatus, at.toISOString(), scheduleId],
     );
   }
+
+  reconcileInterruptedExecutions(at = this.now()): number {
+    return this.database.run(
+      `
+        UPDATE schedules
+        SET last_fire_status = 'failed',
+            updated_at = ?
+        WHERE last_fire_status IS NULL
+          AND last_fired_at IS NOT NULL
+      `,
+      [at.toISOString()],
+    ).changes;
+  }
 }
 
 function computeTriggerState(
