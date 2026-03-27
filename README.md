@@ -13,7 +13,7 @@ Most "agent frameworks" operate at the wrong abstraction layer. Define a minimal
 | `http` | Network communication (REST/GraphQL API calls) |
 | `file_read` | Read files and directories (read-only, safe) |
 | `file_write` | Create and modify files (destructive, separated from read for security) |
-| `execute` | Planned for Slice 06 (not yet implemented) |
+| `execute` | Run shell commands in a sandboxed workspace |
 | `memory` | Persistent knowledge store (SQLite + FTS5, keyed + fuzzy search) |
 | `schedule` | Time-based triggers (`cron` and `once` shipped; `event` deferred) |
 | `interact` | Human communication (notify, ask, approve modes) |
@@ -120,18 +120,19 @@ docs/
 
 ## Current Status
 
-Slices **01-05 are shipped**:
+Slices **01-07 are shipped** (hardening is in progress):
 
 - Slice 01: daemon skeleton, config loading, streaming LLM loop, session management, PID handling, graceful shutdown
 - Slice 02: `memory`, `file_read`, and `file_write`
 - Slice 03: declarative tool specs, `spec.*` system tools, HTTP-backed operation execution, auth flows
 - Slice 04: policy enforcement and approval gating
 - Slice 05: scheduling with `cron` and `once` triggers plus triggered-session execution
+- Slice 06: `execute` primitive with environment sanitization and workspace sandboxing
+- Slice 07: hardening — context budget/compaction, session continuity and recovery
 
 Still deferred / planned:
 
 - `schedule` `event` triggers are deferred
-- `execute` remains planned for Slice 06 and is not implemented yet
 
 ### Roadmap
 
@@ -142,8 +143,8 @@ Still deferred / planned:
 | 03 | Tool Spec Interpreter & HTTP | Shipped |
 | 04 | Policy Enforcement | Shipped |
 | 05 | Scheduling | Shipped (`cron` / `once`; `event` deferred) |
-| 06 | Execute Primitive | Planned |
-| 07 | Hardening | Planned |
+| 06 | Execute Primitive | Shipped |
+| 07 | Hardening | In Progress |
 
 See `docs/implementation/` for detailed plans for each slice.
 

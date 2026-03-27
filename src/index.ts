@@ -11,8 +11,10 @@ import { acquirePidFile } from "./runtime/pid.ts";
 import { closeDatabase, getDatabase } from "./db/database.ts";
 import { resolveExecuteWorkspaceDir } from "./config/schema.ts";
 import { createContinuityAwareSystemPromptBuilder } from "./continuity/prompt.ts";
+import { createLogger } from "./logger.ts";
 
 async function main(): Promise<void> {
+  const log = createLogger();
   const agentHome = resolveAgentHome();
   const pidLock = await acquirePidFile(`${agentHome}/agent.pid`);
   let adapter: WebSocketCommunicationAdapter | undefined;
@@ -26,12 +28,12 @@ async function main(): Promise<void> {
     }
 
     shuttingDown = true;
-    console.log(`Received ${signal}. Shutting down...`);
+    log.info(`Received ${signal}. Shutting down...`);
 
     await scheduler?.stop();
     const completed = await runtime?.shutdown(30_000);
     if (completed === false) {
-      console.warn("Shutdown timed out while waiting for the active session to finish.");
+      log.warn("Shutdown timed out while waiting for the active session to finish.");
     }
 
     await adapter?.stop();
@@ -88,17 +90,17 @@ async function main(): Promise<void> {
       void shutdown("SIGTERM");
     });
 
-    console.log("Agent daemon ready");
-    console.log(`Config: ${config.configPath}`);
-    console.log(`Port: ${adapter.getPort()}`);
-    console.log(`Model: ${config.llm.model}`);
-    console.log(`Timezone: ${config.runtime.timezone}`);
+    log.info("Agent daemon ready");
+    log.info(`Config: ${config.configPath}`);
+    log.info(`Port: ${adapter.getPort()}`);
+    log.info(`Model: ${config.llm.model}`);
+    log.info(`Timezone: ${config.runtime.timezone}`);
   } catch (error) {
     await scheduler?.stop();
     await adapter?.stop();
     closeDatabase();
     await pidLock.release();
-    console.error(toErrorMessage(error));
+    log.error(toErrorMessage(error));
     process.exit(1);
   }
 }
