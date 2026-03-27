@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import { withSqliteLockRetry } from "../db/database.ts";
 
 const SESSION_SUMMARY_PREFIX = "session_summary:";
 const LONG_LIVED_PREFIXES = [
@@ -56,48 +57,50 @@ export function loadContinuitySnapshot(
   database: Database,
   options: ContinuitySelectionOptions = {},
 ): ContinuitySnapshot {
-  const maxSummaries = options.maxSummaries ?? DEFAULT_MAX_SUMMARIES;
-  const maxLongLivedEntries = options.maxLongLivedEntries ?? DEFAULT_MAX_LONG_LIVED_ENTRIES;
-  const maxSummaryChars = options.maxSummaryChars ?? DEFAULT_MAX_SUMMARY_CHARS;
-  const maxLongLivedChars = options.maxLongLivedChars ?? DEFAULT_MAX_LONG_LIVED_CHARS;
-  const longLivedSelectionLimit = Math.max(maxLongLivedEntries * 4, maxLongLivedEntries);
+  return withSqliteLockRetry("continuity snapshot load", () => {
+    const maxSummaries = options.maxSummaries ?? DEFAULT_MAX_SUMMARIES;
+    const maxLongLivedEntries = options.maxLongLivedEntries ?? DEFAULT_MAX_LONG_LIVED_ENTRIES;
+    const maxSummaryChars = options.maxSummaryChars ?? DEFAULT_MAX_SUMMARY_CHARS;
+    const maxLongLivedChars = options.maxLongLivedChars ?? DEFAULT_MAX_LONG_LIVED_CHARS;
+    const longLivedSelectionLimit = Math.max(maxLongLivedEntries * 4, maxLongLivedEntries);
 
-  const summaries = database
-    .query<ContinuityRow, [number]>(`
-      SELECT id, key, value, updated_at
-      FROM memory
-      WHERE domain IS NULL
-        AND key LIKE 'session_summary:%'
-      ORDER BY updated_at DESC, id DESC
-      LIMIT ?
-    `)
-    .all(maxSummaries)
-    .map((row) => mapContinuityRow(row, maxSummaryChars))
-    .filter((entry) => entry !== null);
+    const summaries = database
+      .query<ContinuityRow, [number]>(`
+        SELECT id, key, value, updated_at
+        FROM memory
+        WHERE domain IS NULL
+          AND key LIKE 'session_summary:%'
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+      `)
+      .all(maxSummaries)
+      .map((row) => mapContinuityRow(row, maxSummaryChars))
+      .filter((entry) => entry !== null);
 
-  const longLived = database
-    .query<ContinuityRow, [number]>(`
-      SELECT id, key, value, updated_at
-      FROM memory
-      WHERE domain IS NULL
-        AND (
-          key LIKE 'user.preference:%'
-          OR key LIKE 'user.profile:%'
-          OR key LIKE 'project.context:%'
-        )
-      ORDER BY updated_at DESC, id DESC
-      LIMIT ?
-    `)
-    .all(longLivedSelectionLimit)
-    .filter((row) => !isLikelySecretLikeKey(row.key))
-    .map((row) => mapContinuityRow(row, maxLongLivedChars))
-    .filter((entry) => entry !== null)
-    .slice(0, maxLongLivedEntries);
+    const longLived = database
+      .query<ContinuityRow, [number]>(`
+        SELECT id, key, value, updated_at
+        FROM memory
+        WHERE domain IS NULL
+          AND (
+            key LIKE 'user.preference:%'
+            OR key LIKE 'user.profile:%'
+            OR key LIKE 'project.context:%'
+          )
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?
+      `)
+      .all(longLivedSelectionLimit)
+      .filter((row) => !isLikelySecretLikeKey(row.key))
+      .map((row) => mapContinuityRow(row, maxLongLivedChars))
+      .filter((entry) => entry !== null)
+      .slice(0, maxLongLivedEntries);
 
-  return {
-    summaries,
-    longLived,
-  };
+    return {
+      summaries,
+      longLived,
+    };
+  });
 }
 
 export function formatContinuityBlock(snapshot: ContinuitySnapshot): string | null {

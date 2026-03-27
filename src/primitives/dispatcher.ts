@@ -17,6 +17,7 @@ import type { AuthDependencies } from "../interpreter/auth.ts";
 import { ToolSpecRegistry } from "../specs/registry.ts";
 import { ToolSpecInterpreter } from "../interpreter/pipeline.ts";
 import { buildRawHttpRequest, buildSpecHttpRequest, validateAndNormalizeOperationInput } from "../interpreter/request-builder.ts";
+import { Logger } from "../observability/logger.ts";
 import { SYSTEM_TOOL_DECLARATIONS, SystemToolHandler } from "../system-tools/handler.ts";
 import { isPolicyExemptPrimitive, PolicyEngine } from "../policy/engine.ts";
 import { loadPolicy } from "../policy/loader.ts";
@@ -39,6 +40,7 @@ export interface PrimitiveDispatcherOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   seedTrustedSpecs?: boolean;
+  logger?: Logger;
 }
 
 export class PrimitiveDispatcher {
@@ -49,9 +51,11 @@ export class PrimitiveDispatcher {
   private readonly policy: LoadedPolicy;
   private readonly policyEngine: PolicyEngine;
   private readonly fileHandlerOptions: FileHandlerOptions;
+  private readonly logger: Logger;
   private interactionHandler: InteractionHandler | undefined;
 
   constructor(options: PrimitiveDispatcherOptions = {}) {
+    const baseLogger = options.logger ?? new Logger();
     const agentHome = options.agentHome ?? DEFAULT_AGENT_HOME;
     const workspaceDir = options.workspaceDir ?? process.cwd();
     const executeWorkspaceDir = options.executeWorkspaceDir ?? resolveExecuteWorkspaceDir(agentHome);
@@ -65,6 +69,7 @@ export class PrimitiveDispatcher {
     } satisfies FileHandlerOptions;
     const memoryHandler = createMemoryHandler({
       getDatabase: () => runtimeDatabase,
+      logger: baseLogger,
     });
     const registry = new ToolSpecRegistry({
       agentHome,
@@ -91,11 +96,13 @@ export class PrimitiveDispatcher {
     this.interpreter = interpreter;
     this.policy = policy;
     this.fileHandlerOptions = fileHandlerOptions;
+    this.logger = baseLogger.child({ component: "primitives.dispatcher" });
     this.policyEngine = new PolicyEngine({
       policy,
       workspaceDir,
       homeDir,
-      rateLimiter: new PolicyRateLimiter({ database: runtimeDatabase }),
+      rateLimiter: new PolicyRateLimiter({ database: runtimeDatabase, logger: baseLogger }),
+      logger: baseLogger,
     });
     this.handlers = {
       http: async (params) => await interpreter.executeRawHttp(params),
@@ -111,6 +118,7 @@ export class PrimitiveDispatcher {
         getDatabase: () => runtimeDatabase,
         now: options.now,
         timeZone: options.timeZone,
+        logger: baseLogger,
       }),
       interact: createInteractHandler(() => this.interactionHandler),
     };
@@ -146,40 +154,73 @@ export class PrimitiveDispatcher {
     params: Record<string, unknown>,
     context: PrimitiveContext,
   ): Promise<PrimitiveResult> {
-    if (KNOWN_PRIMITIVES.has(primitiveName)) {
-      const policyResult = await this.enforcePrimitivePolicy(primitiveName, params, context);
-      if (policyResult) {
-        return policyResult;
+    this.logger.info("primitive.dispatch.start", {
+      primitiveName,
+      sessionId: context.sessionId,
+      triggerSource: context.triggerSource,
+    });
+
+    try {
+      let result: PrimitiveResult;
+
+      if (KNOWN_PRIMITIVES.has(primitiveName)) {
+        const policyResult = await this.enforcePrimitivePolicy(primitiveName, params, context);
+        if (policyResult) {
+          result = policyResult;
+        } else {
+          const handler = this.handlers[primitiveName];
+          result = handler
+            ? await handler(params, context)
+            : {
+                success: false,
+                error: "Primitive not implemented yet",
+              };
+        }
+      } else if (this.systemToolHandler.canHandle(primitiveName)) {
+        result = await this.systemToolHandler.dispatch(primitiveName, params, context);
+      } else if (this.registry.getOperation(primitiveName)) {
+        const policyResult = await this.enforceOperationPolicy(primitiveName, params, context);
+        if (policyResult) {
+          result = policyResult;
+        } else {
+          result = await this.interpreter.executeOperation(primitiveName, params, context);
+        }
+      } else {
+        result = {
+          success: false,
+          error: `Unknown primitive or tool: ${primitiveName}`,
+        };
       }
 
-      const handler = this.handlers[primitiveName];
-      if (handler) {
-        return await handler(params, context);
+      if (result.success) {
+        this.logger.info("primitive.dispatch.complete", {
+          primitiveName,
+          sessionId: context.sessionId,
+          triggerSource: context.triggerSource,
+          success: true,
+        });
+      } else {
+        this.logger.warn("primitive.dispatch.complete", {
+          primitiveName,
+          sessionId: context.sessionId,
+          triggerSource: context.triggerSource,
+          success: false,
+          error: result.error,
+        });
       }
-
+      return result;
+    } catch (error) {
+      this.logger.error("primitive.dispatch.error", {
+        primitiveName,
+        sessionId: context.sessionId,
+        triggerSource: context.triggerSource,
+        error,
+      });
       return {
         success: false,
-        error: "Primitive not implemented yet",
+        error: toErrorMessage(error),
       };
     }
-
-    if (this.systemToolHandler.canHandle(primitiveName)) {
-      return await this.systemToolHandler.dispatch(primitiveName, params, context);
-    }
-
-    if (this.registry.getOperation(primitiveName)) {
-      const policyResult = await this.enforceOperationPolicy(primitiveName, params, context);
-      if (policyResult) {
-        return policyResult;
-      }
-
-      return await this.interpreter.executeOperation(primitiveName, params, context);
-    }
-
-    return {
-      success: false,
-      error: `Unknown primitive or tool: ${primitiveName}`,
-    };
   }
 
   private async enforcePrimitivePolicy(

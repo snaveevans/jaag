@@ -1,9 +1,13 @@
 import type { ServerWebSocket } from "bun";
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "./adapter.ts";
+import { Logger } from "../observability/logger.ts";
 
 interface WebSocketAdapterOptions {
   port: number;
   hostname?: string;
+  maxBufferedMessages?: number;
+  maxBufferedBytes?: number;
+  logger?: Logger;
 }
 
 interface DeliveryDeferred {
@@ -13,6 +17,10 @@ interface DeliveryDeferred {
 }
 
 type QueuedEvent =
+  | { type: "message"; payload: OutboundMessage; deliveryDeferred: DeliveryDeferred; serialized: string; sizeBytes: number }
+  | { type: "stream_chunk"; payload: { sessionId: string; content: string }; deliveryDeferred: DeliveryDeferred; serialized: string; sizeBytes: number };
+
+type QueuedEventInput =
   | { type: "message"; payload: OutboundMessage; deliveryDeferred: DeliveryDeferred }
   | { type: "stream_chunk"; payload: { sessionId: string; content: string }; deliveryDeferred: DeliveryDeferred };
 
@@ -27,7 +35,11 @@ type ServerEnvelope =
 export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   private readonly port: number;
   private readonly hostname: string;
+  private readonly maxBufferedMessages: number;
+  private readonly maxBufferedBytes: number;
+  private readonly logger: Logger;
   private readonly outboundQueue: QueuedEvent[] = [];
+  private outboundQueueBytes = 0;
   private server?: Bun.Server<undefined>;
   private socket: ServerWebSocket<undefined> | null = null;
   private messageHandler: ((message: InboundMessage) => void) | null = null;
@@ -35,6 +47,9 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   constructor(options: WebSocketAdapterOptions) {
     this.port = options.port;
     this.hostname = options.hostname ?? "127.0.0.1";
+    this.maxBufferedMessages = options.maxBufferedMessages ?? 100;
+    this.maxBufferedBytes = options.maxBufferedBytes ?? 1024 * 1024;
+    this.logger = (options.logger ?? new Logger()).child({ component: "communication.websocket" });
   }
 
   async start(): Promise<void> {
@@ -73,10 +88,21 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
           try {
             envelope = JSON.parse(text) as ClientEnvelope;
           } catch {
+            this.logger.warn("websocket.inbound.malformed", {
+              reason: "invalid JSON",
+            });
             return;
           }
 
-          if (envelope.type !== "message" || typeof envelope.content !== "string") {
+          if (
+            typeof envelope !== "object"
+            || envelope === null
+            || envelope.type !== "message"
+            || typeof envelope.content !== "string"
+          ) {
+            this.logger.warn("websocket.inbound.unsupported", {
+              envelopeType: typeof envelope === "object" && envelope !== null ? envelope.type : undefined,
+            });
             return;
           }
 
@@ -97,7 +123,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
   async stop(): Promise<void> {
     while (this.outboundQueue.length > 0) {
-      const queuedEvent = this.outboundQueue.shift();
+      const queuedEvent = this.shiftQueuedEvent();
       queuedEvent?.deliveryDeferred.reject(new Error("WebSocket adapter stopped before queued event delivery."));
     }
 
@@ -107,19 +133,19 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   }
 
   async send(message: OutboundMessage): Promise<DeliveryResult> {
-    return this.enqueueOrSend({
+    return this.enqueueOrSend(createQueuedEvent({
       type: "message",
       payload: message,
       deliveryDeferred: createDeliveryDeferred(),
-    });
+    }));
   }
 
   async sendStreamChunk(sessionId: string, content: string): Promise<DeliveryResult> {
-    return this.enqueueOrSend({
+    return this.enqueueOrSend(createQueuedEvent({
       type: "stream_chunk",
       payload: { sessionId, content },
       deliveryDeferred: createDeliveryDeferred(),
-    });
+    }));
   }
 
   onMessage(handler: (message: InboundMessage) => void): void {
@@ -140,16 +166,11 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
   private async enqueueOrSend(event: QueuedEvent): Promise<DeliveryResult> {
     if (!this.socket) {
-      this.outboundQueue.push(event);
-      return {
-        delivered: false,
-        queuePosition: this.outboundQueue.length,
-        whenDelivered: event.deliveryDeferred.promise,
-      };
+      return this.enqueueBufferedEvent(event);
     }
 
     try {
-      this.socket.send(JSON.stringify(toServerEnvelope(event)));
+      this.socket.send(event.serialized);
       event.deliveryDeferred.resolve();
       return {
         delivered: true,
@@ -157,35 +178,124 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
       };
     } catch {
       this.socket = null;
-      this.outboundQueue.push(event);
-      return {
-        delivered: false,
-        queuePosition: this.outboundQueue.length,
-        whenDelivered: event.deliveryDeferred.promise,
-      };
+      return this.enqueueBufferedEvent(event);
     }
   }
 
   private async flushQueuedEvents(): Promise<void> {
     while (this.socket && this.outboundQueue.length > 0) {
-      const nextEvent = this.outboundQueue.shift();
+      const nextEvent = this.shiftQueuedEvent();
       if (!nextEvent) {
         return;
       }
 
       try {
-        this.socket.send(JSON.stringify(toServerEnvelope(nextEvent)));
+        this.socket.send(nextEvent.serialized);
         nextEvent.deliveryDeferred.resolve();
       } catch {
-        this.outboundQueue.unshift(nextEvent);
+        this.prependQueuedEvent(nextEvent);
         this.socket = null;
         return;
       }
     }
   }
+
+  private enqueueBufferedEvent(event: QueuedEvent): DeliveryResult {
+    this.pushQueuedEvent(event);
+    this.trimQueueToFit();
+
+    const queuePosition = this.outboundQueue.indexOf(event);
+    return queuePosition >= 0
+      ? {
+          delivered: false,
+          queuePosition: queuePosition + 1,
+          whenDelivered: event.deliveryDeferred.promise,
+        }
+      : {
+          delivered: false,
+          whenDelivered: event.deliveryDeferred.promise,
+        };
+  }
+
+  private trimQueueToFit(): void {
+    const droppedEvents: QueuedEvent[] = [];
+
+    while (
+      this.outboundQueue.length > this.maxBufferedMessages
+      || this.outboundQueueBytes > this.maxBufferedBytes
+    ) {
+      const droppedEvent = this.shiftQueuedEvent();
+      if (!droppedEvent) {
+        break;
+      }
+
+      droppedEvents.push(droppedEvent);
+    }
+
+    if (droppedEvents.length === 0) {
+      return;
+    }
+
+    for (const droppedEvent of droppedEvents) {
+      droppedEvent.deliveryDeferred.reject(new Error("WebSocket outbound buffer overflowed before queued event delivery."));
+    }
+
+    this.logger.warn("websocket.buffer.overflow", {
+      droppedCount: droppedEvents.length,
+      droppedBytes: droppedEvents.reduce((total, entry) => total + entry.sizeBytes, 0),
+      bufferedMessages: this.outboundQueue.length,
+      bufferedBytes: this.outboundQueueBytes,
+      maxBufferedMessages: this.maxBufferedMessages,
+      maxBufferedBytes: this.maxBufferedBytes,
+    });
+  }
+
+  private pushQueuedEvent(event: QueuedEvent): void {
+    this.outboundQueue.push(event);
+    this.outboundQueueBytes += event.sizeBytes;
+  }
+
+  private prependQueuedEvent(event: QueuedEvent): void {
+    this.outboundQueue.unshift(event);
+    this.outboundQueueBytes += event.sizeBytes;
+  }
+
+  private shiftQueuedEvent(): QueuedEvent | undefined {
+    const event = this.outboundQueue.shift();
+    if (event) {
+      this.outboundQueueBytes = Math.max(0, this.outboundQueueBytes - event.sizeBytes);
+    }
+
+    return event;
+  }
 }
 
 function toServerEnvelope(event: QueuedEvent): ServerEnvelope {
+  if (event.type === "message") {
+    return {
+      type: "message",
+      ...event.payload,
+    };
+  }
+
+  return {
+    type: "stream_chunk",
+    sessionId: event.payload.sessionId,
+    content: event.payload.content,
+  };
+}
+
+function createQueuedEvent(event: QueuedEventInput): QueuedEvent {
+  const serialized = JSON.stringify(toServerEnvelopeInput(event));
+  const sizeBytes = new TextEncoder().encode(serialized).byteLength;
+  return {
+    ...event,
+    serialized,
+    sizeBytes,
+  } as QueuedEvent;
+}
+
+function toServerEnvelopeInput(event: QueuedEventInput): ServerEnvelope {
   if (event.type === "message") {
     return {
       type: "message",

@@ -1,5 +1,6 @@
 import OpenAI, { APIError } from "openai";
-import type { LLMProvider } from "./provider.ts";
+import { LLMProviderUnavailableError, type LLMProvider } from "./provider.ts";
+import { Logger } from "../observability/logger.ts";
 import type { InternalMessage, ModelConfig, StreamChunk, ToolCall, ToolDeclaration } from "./types.ts";
 
 interface ToolCallState {
@@ -7,7 +8,17 @@ interface ToolCallState {
   toolCall: ToolCall;
 }
 
+export interface OpenAICompatibleProviderOptions {
+  logger?: Logger;
+}
+
 export class OpenAICompatibleProvider implements LLMProvider {
+  private readonly logger: Logger;
+
+  constructor(options: OpenAICompatibleProviderOptions = {}) {
+    this.logger = (options.logger ?? new Logger()).child({ component: "llm.openai" });
+  }
+
   async *stream(
     messages: InternalMessage[],
     tools: ToolDeclaration[],
@@ -18,9 +29,16 @@ export class OpenAICompatibleProvider implements LLMProvider {
       baseURL: config.baseUrl,
     });
     const toolNameMap = buildToolNameMap(tools);
+    let textLength = 0;
 
     const toolCallState = new Map<number, ToolCallState>();
     let emittedToolCallEnd = false;
+
+    this.logger.info("llm.request.started", {
+      model: config.model,
+      messageCount: messages.length,
+      toolCount: tools.length,
+    });
 
     try {
       const response = await client.chat.completions.create({
@@ -41,6 +59,7 @@ export class OpenAICompatibleProvider implements LLMProvider {
         const delta = choice.delta;
 
         if (delta.content) {
+          textLength += delta.content.length;
           yield { type: "text", content: delta.content };
         }
 
@@ -106,15 +125,35 @@ export class OpenAICompatibleProvider implements LLMProvider {
         }
       }
 
+      this.logger.info("llm.request.completed", {
+        model: config.model,
+        messageCount: messages.length,
+        toolCount: tools.length,
+        toolCallCount: toolCallState.size,
+        textLength,
+      });
       yield { type: "done" };
     } catch (error) {
       if (error instanceof APIError) {
-        throw new Error(
-          `OpenAI-compatible API error (${error.status ?? "unknown"}): ${error.message}`,
-        );
+        const message = `OpenAI-compatible API error (${error.status ?? "unknown"}): ${error.message}`;
+        this.logger.error("llm.request.failed", {
+          model: config.model,
+          status: error.status ?? null,
+          error,
+        });
+        if (error.status === undefined || error.status === 429 || error.status >= 500) {
+          throw new LLMProviderUnavailableError(message);
+        }
+
+        throw new Error(message);
       }
 
-      throw new Error(`OpenAI-compatible request failed: ${toErrorMessage(error)}`);
+      const message = `OpenAI-compatible request failed: ${toErrorMessage(error)}`;
+      this.logger.error("llm.request.failed", {
+        model: config.model,
+        error,
+      });
+      throw new LLMProviderUnavailableError(message);
     }
   }
 }

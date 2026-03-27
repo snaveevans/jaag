@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { OpenAICompatibleProvider } from "./openai.ts";
+import { LLMProviderUnavailableError } from "./provider.ts";
 import type { InternalMessage, StreamChunk, ToolDeclaration } from "./types.ts";
 
 const servers: Bun.Server<unknown>[] = [];
@@ -225,6 +226,74 @@ describe("OpenAICompatibleProvider", () => {
       { type: "done" },
     ]);
   });
+
+  test("maps 429 API errors to provider unavailable errors", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({
+        error: {
+          message: "Rate limited.",
+        },
+      }, {
+        status: 429,
+      }),
+    });
+    servers.push(server);
+
+    const error = await captureStreamFailure(`http://127.0.0.1:${server.port}/v1`);
+
+    expect(error).toBeInstanceOf(LLMProviderUnavailableError);
+  });
+
+  test("maps 500+ API errors to provider unavailable errors", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({
+        error: {
+          message: "Provider outage.",
+        },
+      }, {
+        status: 503,
+      }),
+    });
+    servers.push(server);
+
+    const error = await captureStreamFailure(`http://127.0.0.1:${server.port}/v1`);
+
+    expect(error).toBeInstanceOf(LLMProviderUnavailableError);
+  });
+
+  test("maps network failures to provider unavailable errors", async () => {
+    const unavailableServer = Bun.serve({
+      port: 0,
+      fetch: () => new Response("unused"),
+    });
+    const baseUrl = `http://127.0.0.1:${unavailableServer.port}/v1`;
+    unavailableServer.stop(true);
+
+    const error = await captureStreamFailure(baseUrl);
+
+    expect(error).toBeInstanceOf(LLMProviderUnavailableError);
+  });
+
+  test("keeps 400 API errors as regular errors", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => Response.json({
+        error: {
+          message: "Bad request.",
+        },
+      }, {
+        status: 400,
+      }),
+    });
+    servers.push(server);
+
+    const error = await captureStreamFailure(`http://127.0.0.1:${server.port}/v1`);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(LLMProviderUnavailableError);
+  });
 });
 
 function buildSseBody(frames = [
@@ -244,4 +313,23 @@ function buildSseBody(frames = [
       controller.close();
     },
   });
+}
+
+async function captureStreamFailure(baseUrl: string): Promise<unknown> {
+  const provider = new OpenAICompatibleProvider();
+
+  try {
+    for await (const _chunk of provider.stream([{ role: "user", content: "hello" }], [], {
+      model: "gpt-4o-mini",
+      baseUrl,
+      temperature: 0,
+      maxOutputTokens: 128,
+      apiKey: "test-key",
+    })) {
+    }
+  } catch (error) {
+    return error;
+  }
+
+  throw new Error("Expected provider.stream to throw.");
 }

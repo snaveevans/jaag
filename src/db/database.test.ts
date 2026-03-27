@@ -3,7 +3,14 @@ import type { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initializeDatabase, resolveDatabasePath, verifyDatabaseIntegrity } from "./database.ts";
+import { Logger } from "../observability/logger.ts";
+import {
+  initializeDatabase,
+  resolveDatabasePath,
+  SqliteLockTimeoutError,
+  verifyDatabaseIntegrity,
+  withSqliteLockRetry,
+} from "./database.ts";
 
 const databases: Database[] = [];
 const tempDirs: string[] = [];
@@ -112,6 +119,120 @@ describe("initializeDatabase", () => {
   });
 });
 
+describe("withSqliteLockRetry", () => {
+  test("returns immediately without logging when the first attempt succeeds", () => {
+    const { parsed, sink } = createCaptureSink();
+    const logger = new Logger({ sink });
+    let attempts = 0;
+
+    const result = withSqliteLockRetry("test operation", () => {
+      attempts += 1;
+      return "done";
+    }, {
+      logger,
+      sleep: () => {
+        throw new Error("sleep should not be called when the first attempt succeeds");
+      },
+    });
+
+    expect(result).toBe("done");
+    expect(attempts).toBe(1);
+    expect(parsed()).toEqual([]);
+  });
+
+  test("retries SQLite lock errors and logs retry warnings before succeeding", () => {
+    const { parsed, sink } = createCaptureSink();
+    const logger = new Logger({ sink });
+    const sleepCalls: number[] = [];
+    let attempts = 0;
+
+    const result = withSqliteLockRetry("test operation", () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("database is locked");
+      }
+
+      return "done";
+    }, {
+      logger,
+      baseDelayMs: 5,
+      maxDelayMs: 5,
+      sleep: (delayMs) => {
+        sleepCalls.push(delayMs);
+      },
+    });
+
+    expect(result).toBe("done");
+    expect(attempts).toBe(2);
+    expect(sleepCalls).toEqual([5]);
+    expect(parsed()).toContainEqual(expect.objectContaining({
+      level: "warn",
+      event: "sqlite.lock.retry",
+      component: "db.database",
+      operationName: "test operation",
+      attempt: 1,
+      delayMs: 5,
+    }));
+  });
+
+  test("throws SqliteLockTimeoutError and logs the final failure when retries are exhausted", () => {
+    const { parsed, sink } = createCaptureSink();
+    const logger = new Logger({ sink });
+    const sleepCalls: number[] = [];
+    let attempts = 0;
+    let thrown: unknown;
+
+    try {
+      withSqliteLockRetry("test operation", () => {
+        attempts += 1;
+        throw new Error("database table is locked");
+      }, {
+        logger,
+        maxRetries: 2,
+        baseDelayMs: 5,
+        maxDelayMs: 10,
+        sleep: (delayMs) => {
+          sleepCalls.push(delayMs);
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SqliteLockTimeoutError);
+    expect((thrown as Error).message).toBe("SQLite lock retry exhausted while test operation. Try again shortly.");
+    expect(attempts).toBe(3);
+    expect(sleepCalls).toEqual([5, 10]);
+    expect(parsed()).toContainEqual(expect.objectContaining({
+      level: "error",
+      event: "sqlite.lock.failed",
+      component: "db.database",
+      operationName: "test operation",
+      attempts: 3,
+    }));
+  });
+
+  test("rethrows non-lock errors immediately without retry logging", () => {
+    const { parsed, sink } = createCaptureSink();
+    const logger = new Logger({ sink });
+    let attempts = 0;
+    const failure = new Error("boom");
+
+    expect(() => withSqliteLockRetry("test operation", () => {
+      attempts += 1;
+      throw failure;
+    }, {
+      logger,
+      sleep: () => {
+        throw new Error("sleep should not be called for non-lock errors");
+      },
+    })).toThrow("boom");
+
+    expect(attempts).toBe(1);
+    expect(parsed()).toEqual([]);
+  });
+});
+
 function searchCount(database: Database, query: string): number {
   return database
     .query<{ count: number }, any[]>("SELECT COUNT(*) AS count FROM memory_fts WHERE memory_fts MATCH ?")
@@ -122,4 +243,17 @@ async function createHomeDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "agent-db-test-"));
   tempDirs.push(dir);
   return dir;
+}
+
+function createCaptureSink() {
+  const lines: string[] = [];
+  return {
+    sink: {
+      write(line: string) {
+        lines.push(line);
+      },
+    },
+    lines,
+    parsed: () => lines.map((line) => JSON.parse(line.trim()) as Record<string, unknown>),
+  };
 }

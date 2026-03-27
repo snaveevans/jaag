@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { normalize, resolve } from "node:path";
 import { resolveEffectiveFilesystemTargetSync } from "../primitives/file.ts";
 import type { ApprovalDecision, PrimitiveContext, InteractionHandler } from "../primitives/types.ts";
+import { Logger } from "../observability/logger.ts";
 import type {
   ApprovePolicyRule,
   FilePolicyMatch,
@@ -24,6 +25,7 @@ export interface PolicyEngineOptions {
   rateLimiter: PolicyRateLimiter;
   interactionHandler?: InteractionHandler;
   now?: () => Date;
+  logger?: Logger;
 }
 
 export class PolicyEngine {
@@ -33,6 +35,7 @@ export class PolicyEngine {
   private readonly rateLimiter: PolicyRateLimiter;
   private interactionHandler?: InteractionHandler;
   private readonly now: () => Date;
+  private readonly logger: Logger;
 
   constructor(options: PolicyEngineOptions) {
     this.policy = options.policy;
@@ -41,6 +44,7 @@ export class PolicyEngine {
     this.rateLimiter = options.rateLimiter;
     this.interactionHandler = options.interactionHandler;
     this.now = options.now ?? (() => new Date());
+    this.logger = (options.logger ?? new Logger()).child({ component: "policy.engine" });
   }
 
   getSummary(): string {
@@ -52,6 +56,33 @@ export class PolicyEngine {
   }
 
   async enforce(policyContext: PolicyEvaluationContext, context: PrimitiveContext): Promise<PolicyDecision> {
+    try {
+      const decision = await this.enforceInternal(policyContext, context);
+      this.logger.info("policy.enforce.decision", {
+        sessionId: context.sessionId,
+        triggerSource: context.triggerSource,
+        primitive: policyContext.primitive,
+        action: decision.action,
+        ruleId: decision.rule?.id,
+        reason: "reason" in decision ? decision.reason : undefined,
+      });
+      return decision;
+    } catch (error) {
+      const reason = `Policy evaluation failed: ${toErrorMessage(error)}`;
+      this.logger.error("policy.enforce.error", {
+        sessionId: context.sessionId,
+        triggerSource: context.triggerSource,
+        primitive: policyContext.primitive,
+        error,
+      });
+      return {
+        action: "block",
+        reason,
+      };
+    }
+  }
+
+  private async enforceInternal(policyContext: PolicyEvaluationContext, context: PrimitiveContext): Promise<PolicyDecision> {
     const now = this.now();
     const matchingRateLimitRules = this.policy.rules.filter(
       (rule): rule is RateLimitPolicyRule =>
@@ -367,6 +398,14 @@ function formatDuration(durationMs: number): string {
   }
 
   return `${Math.ceil(minutes / 60)}h`;
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
 }
 
 function assertNever(value: never): never {

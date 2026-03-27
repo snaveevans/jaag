@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runDatabaseMigrations } from "../db/migrations.ts";
+import { Logger } from "../observability/logger.ts";
 import { buildMockBearerToolSpec } from "../test/tool-spec-fixtures.ts";
 import { PrimitiveDispatcher } from "./dispatcher.ts";
 
@@ -303,4 +304,65 @@ describe("PrimitiveDispatcher", () => {
       error: "Invalid tool: expected a non-empty string.",
     });
   });
+
+  test("logs failed primitive results as warn entries with the returned error", async () => {
+    const { parsed, sink } = createCaptureSink();
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-dispatcher-log-failure-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const dispatcher = new PrimitiveDispatcher({
+      agentHome,
+      workspaceDir,
+      logger: new Logger({ sink }),
+    });
+
+    dispatcher.setInteractionHandler({
+      notify: async () => ({ delivered: true }),
+      ask: async () => "ack",
+      requestApproval: async () => ({ approved: true, response: "yes" }),
+      hasApprovalReceipt: () => false,
+    });
+
+    const result = await dispatcher.dispatch(
+      "interact",
+      {
+        mode: "approve",
+        message: "Approve the action?",
+        tool: "   ",
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "Invalid tool: expected a non-empty string.",
+    });
+    expect(parsed()).toContainEqual(expect.objectContaining({
+      level: "warn",
+      event: "primitive.dispatch.complete",
+      component: "primitives.dispatcher",
+      primitiveName: "interact",
+      sessionId: "session-1",
+      success: false,
+      error: "Invalid tool: expected a non-empty string.",
+    }));
+  });
 });
+
+function createCaptureSink() {
+  const lines: string[] = [];
+  return {
+    sink: {
+      write(line: string) {
+        lines.push(line);
+      },
+    },
+    lines,
+    parsed: () => lines.map((line) => JSON.parse(line.trim()) as Record<string, unknown>),
+  };
+}

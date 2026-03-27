@@ -1,5 +1,6 @@
 import type { ScheduleStore } from "./store.ts";
 import type { TriggeredScheduleContext } from "./types.ts";
+import { Logger } from "../observability/logger.ts";
 
 export interface SchedulerServiceOptions {
   store: ScheduleStore;
@@ -8,6 +9,7 @@ export interface SchedulerServiceOptions {
   tickIntervalMs?: number;
   setIntervalFn?: typeof setInterval;
   clearIntervalFn?: typeof clearInterval;
+  logger?: Logger;
 }
 
 export class SchedulerService {
@@ -17,6 +19,7 @@ export class SchedulerService {
   private readonly tickIntervalMs: number;
   private readonly setIntervalFn: typeof setInterval;
   private readonly clearIntervalFn: typeof clearInterval;
+  private readonly logger: Logger;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private activeTick: Promise<void> | null = null;
   private stopping = false;
@@ -28,6 +31,7 @@ export class SchedulerService {
     this.tickIntervalMs = options.tickIntervalMs ?? 5_000;
     this.setIntervalFn = options.setIntervalFn ?? setInterval;
     this.clearIntervalFn = options.clearIntervalFn ?? clearInterval;
+    this.logger = (options.logger ?? new Logger()).child({ component: "scheduler.service" });
   }
 
   async start(): Promise<void> {
@@ -36,7 +40,22 @@ export class SchedulerService {
     }
 
     this.stopping = false;
-    this.store.reconcileInterruptedExecutions(this.now());
+    this.logger.info("scheduler.start", {
+      tickIntervalMs: this.tickIntervalMs,
+    });
+    try {
+      const reconciledCount = this.store.reconcileInterruptedExecutions(this.now());
+      if (reconciledCount > 0) {
+        this.logger.warn("scheduler.reconciled_interrupted_executions", {
+          reconciledCount,
+        });
+      }
+    } catch (error) {
+      this.logger.error("scheduler.reconcile.error", {
+        error,
+      });
+    }
+
     await this.runTick();
     this.intervalHandle = this.setIntervalFn(() => {
       void this.runTick();
@@ -52,6 +71,7 @@ export class SchedulerService {
     }
 
     await this.activeTick;
+    this.logger.info("scheduler.stop");
   }
 
   async runTick(): Promise<void> {
@@ -60,9 +80,15 @@ export class SchedulerService {
       return;
     }
 
-    this.activeTick = this.performTick().finally(() => {
-      this.activeTick = null;
-    });
+    this.activeTick = this.performTick()
+      .catch((error) => {
+        this.logger.error("scheduler.tick.error", {
+          error,
+        });
+      })
+      .finally(() => {
+        this.activeTick = null;
+      });
     await this.activeTick;
   }
 
@@ -92,13 +118,47 @@ export class SchedulerService {
         instruction: schedule.instruction,
       };
 
-      void this.launchSchedule(triggeredSchedule, firedAt)
-        .then((success) => {
-          this.store.recordExecutionResult(schedule.schedule_id, success ? "success" : "failed");
-        })
-        .catch(() => {
-          this.store.recordExecutionResult(schedule.schedule_id, "failed");
-        });
+      this.logger.info("scheduler.execution.dispatched", {
+        scheduleId: schedule.schedule_id,
+        workflow: schedule.workflow,
+        firedAt,
+      });
+      void this.trackExecution(schedule, triggeredSchedule, firedAt);
+    }
+  }
+
+  private async trackExecution(
+    schedule: { schedule_id: string; workflow: string },
+    triggeredSchedule: TriggeredScheduleContext,
+    firedAt: Date,
+  ): Promise<void> {
+    try {
+      const success = await this.launchSchedule(triggeredSchedule, firedAt);
+      this.recordExecutionResultSafely(schedule.schedule_id, success ? "success" : "failed");
+      this.logger.info("scheduler.execution.completed", {
+        scheduleId: schedule.schedule_id,
+        workflow: schedule.workflow,
+        success,
+      });
+    } catch (error) {
+      this.recordExecutionResultSafely(schedule.schedule_id, "failed");
+      this.logger.error("scheduler.execution.failed", {
+        scheduleId: schedule.schedule_id,
+        workflow: schedule.workflow,
+        error,
+      });
+    }
+  }
+
+  private recordExecutionResultSafely(scheduleId: string, status: "success" | "failed"): void {
+    try {
+      this.store.recordExecutionResult(scheduleId, status);
+    } catch (error) {
+      this.logger.error("scheduler.execution.record_failed", {
+        scheduleId,
+        status,
+        error,
+      });
     }
   }
 }

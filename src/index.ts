@@ -11,9 +11,12 @@ import { acquirePidFile } from "./runtime/pid.ts";
 import { closeDatabase, getDatabase } from "./db/database.ts";
 import { resolveExecuteWorkspaceDir } from "./config/schema.ts";
 import { createContinuityAwareSystemPromptBuilder } from "./continuity/prompt.ts";
+import { Logger, createFileLogSink } from "./observability/logger.ts";
 
 async function main(): Promise<void> {
   const agentHome = resolveAgentHome();
+  const baseLogger = new Logger({ sink: createFileLogSink(agentHome) });
+  const logger = baseLogger.child({ component: "index" });
   const pidLock = await acquirePidFile(`${agentHome}/agent.pid`);
   let adapter: WebSocketCommunicationAdapter | undefined;
   let runtime: AgentRuntime | undefined;
@@ -26,12 +29,12 @@ async function main(): Promise<void> {
     }
 
     shuttingDown = true;
-    console.log(`Received ${signal}. Shutting down...`);
+    logger.info("daemon.shutdown_requested", { signal });
 
     await scheduler?.stop();
     const completed = await runtime?.shutdown(30_000);
     if (completed === false) {
-      console.warn("Shutdown timed out while waiting for the active session to finish.");
+      logger.warn("daemon.shutdown_timed_out");
     }
 
     await adapter?.stop();
@@ -50,15 +53,17 @@ async function main(): Promise<void> {
       timeZone: config.runtime.timezone,
       workspaceDir: process.cwd(),
       executeWorkspaceDir,
+      logger: baseLogger,
     });
     adapter = new WebSocketCommunicationAdapter({
       port: config.communication.port,
+      logger: baseLogger,
     });
     await adapter.start();
 
     runtime = new AgentRuntime({
       adapter,
-      llmProvider: new OpenAICompatibleProvider(),
+      llmProvider: new OpenAICompatibleProvider({ logger: baseLogger }),
       modelConfig: config.llm,
       sessionManager: new SessionManager({
         buildSystemPrompt: createContinuityAwareSystemPromptBuilder({
@@ -66,9 +71,11 @@ async function main(): Promise<void> {
           getPolicySummary: () => primitiveDispatcher.getPolicySummary(),
           getToolManifests: () => primitiveDispatcher.listToolManifests(),
           timeZone: config.runtime.timezone,
+          logger: baseLogger,
         }),
       }),
       primitiveDispatcher,
+      logger: baseLogger,
     });
     runtime.start();
 
@@ -76,8 +83,10 @@ async function main(): Promise<void> {
       store: new ScheduleStore({
         database,
         timeZone: config.runtime.timezone,
+        logger: baseLogger,
       }),
       launchSchedule: async (schedule, firedAt) => await runtime!.launchTriggeredSchedule(schedule, firedAt),
+      logger: baseLogger,
     });
     await scheduler.start();
 
@@ -87,18 +96,27 @@ async function main(): Promise<void> {
     process.on("SIGTERM", () => {
       void shutdown("SIGTERM");
     });
+    process.on("uncaughtException", (error) => {
+      logger.error("daemon.uncaught_exception", { error });
+    });
+    process.on("unhandledRejection", (reason) => {
+      logger.error("daemon.unhandled_rejection", { error: reason });
+    });
 
-    console.log("Agent daemon ready");
-    console.log(`Config: ${config.configPath}`);
-    console.log(`Port: ${adapter.getPort()}`);
-    console.log(`Model: ${config.llm.model}`);
-    console.log(`Timezone: ${config.runtime.timezone}`);
+    logger.info("daemon.ready", {
+      configPath: config.configPath,
+      port: adapter.getPort(),
+      model: config.llm.model,
+      timezone: config.runtime.timezone,
+    });
   } catch (error) {
     await scheduler?.stop();
     await adapter?.stop();
     closeDatabase();
     await pidLock.release();
-    console.error(toErrorMessage(error));
+    logger.error("daemon.startup_failed", {
+      error,
+    });
     process.exit(1);
   }
 }

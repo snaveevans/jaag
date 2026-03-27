@@ -1,5 +1,5 @@
 import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
-import type { LLMProvider } from "../llm/provider.ts";
+import { LLMProviderUnavailableError, type LLMProvider } from "../llm/provider.ts";
 import type { InternalMessage, ModelConfig, ToolCall, ToolDeclaration } from "../llm/types.ts";
 import {
   buildCompactionRequestMessages,
@@ -24,6 +24,7 @@ import { createApprovalReceipt } from "../policy/receipts.ts";
 import type { TriggeredScheduleContext } from "../scheduler/types.ts";
 import { SessionManager } from "../session/manager.ts";
 import type { AgentSession } from "../session/session.ts";
+import { Logger } from "../observability/logger.ts";
 
 const USER_RESPONSE_TIMEOUT_MS = 5 * 60 * 1000;
 const SCHEDULED_USER_RESPONSE_TIMEOUT_MS = 2 * 60 * 1000;
@@ -59,6 +60,7 @@ export interface AgentRuntimeOptions {
   primitiveDispatcher: PrimitiveDispatcher;
   userResponseTimeoutMs?: number;
   scheduledUserResponseTimeoutMs?: number;
+  logger?: Logger;
 }
 
 export class AgentRuntime {
@@ -69,6 +71,7 @@ export class AgentRuntime {
   private readonly primitiveDispatcher: PrimitiveDispatcher;
   private readonly userResponseTimeoutMs: number;
   private readonly scheduledUserResponseTimeoutMs: number;
+  private readonly logger: Logger;
   private readonly inboundQueue: InboundMessage[] = [];
   private readonly activeBackgroundTasks = new Set<Promise<boolean>>();
   private readonly queuedUserResponseRequests: UserResponseRequest[] = [];
@@ -85,6 +88,7 @@ export class AgentRuntime {
     this.primitiveDispatcher = options.primitiveDispatcher;
     this.userResponseTimeoutMs = options.userResponseTimeoutMs ?? USER_RESPONSE_TIMEOUT_MS;
     this.scheduledUserResponseTimeoutMs = options.scheduledUserResponseTimeoutMs ?? SCHEDULED_USER_RESPONSE_TIMEOUT_MS;
+    this.logger = (options.logger ?? new Logger()).child({ component: "runtime.agent" });
     this.primitiveDispatcher.setAuthorizationCodeHandler(async (message, context) => {
       return await this.requestAuthorizationCode(message, context);
     });
@@ -97,6 +101,7 @@ export class AgentRuntime {
     }
 
     this.started = true;
+    this.logger.info("runtime.started");
     this.adapter.onMessage((message) => {
       if (this.shuttingDown) {
         return;
@@ -114,6 +119,7 @@ export class AgentRuntime {
 
   async shutdown(timeoutMs = 30_000): Promise<boolean> {
     this.shuttingDown = true;
+    this.logger.info("runtime.shutdown_requested", { timeoutMs });
     this.rejectAllUserResponseRequests("Runtime is shutting down.");
     return this.waitForIdle(timeoutMs);
   }
@@ -136,8 +142,7 @@ export class AgentRuntime {
       return Promise.resolve(false);
     }
 
-    const task = this.sessionManager.createTriggeredSession(schedule, firedAt)
-      .then(async (session) => await this.runTriggeredSession(session));
+    const task = this.startTriggeredScheduleTask(schedule, firedAt);
     this.activeBackgroundTasks.add(task);
     void task.finally(() => {
       this.activeBackgroundTasks.delete(task);
@@ -165,19 +170,28 @@ export class AgentRuntime {
         return;
       }
 
-      const session = await this.sessionManager.getOrCreateInteractiveSession(inbound.timestamp);
+      let session: AgentSession | undefined;
       try {
+        session = await this.sessionManager.getOrCreateInteractiveSession(inbound.timestamp);
+        this.logger.info("runtime.session.interactive.processing", {
+          sessionId: session.id,
+        });
         await this.processSession(session, {
           initialUserMessage: inbound,
           completeOnAssistantText: false,
         });
-      } catch (error) {
-        this.sessionManager.failSession(session.id);
-        await this.adapter.send({
+        this.logger.info("runtime.session.interactive.idle", {
           sessionId: session.id,
-          mode: "notify",
-          content: `Runtime error: ${toErrorMessage(error)}`,
+          status: session.status,
         });
+      } catch (error) {
+        if (session) {
+          await this.handleSessionFailure(session, error, "runtime.session.interactive.failed");
+        } else {
+          this.logger.error("runtime.session.interactive.start_failed", {
+            error,
+          });
+        }
       }
 
       if (this.shuttingDown) {
@@ -381,7 +395,11 @@ export class AgentRuntime {
       });
 
       return result.success;
-    } catch {
+    } catch (error) {
+      this.logger.warn("runtime.compaction.persist_failed", {
+        sessionId: session.id,
+        error,
+      });
       return false;
     }
   }
@@ -738,6 +756,53 @@ export class AgentRuntime {
     }, request.timeoutRemainingMs);
   }
 
+  private async startTriggeredScheduleTask(schedule: TriggeredScheduleContext, firedAt: Date): Promise<boolean> {
+    try {
+      const session = await this.sessionManager.createTriggeredSession(schedule, firedAt);
+      this.logger.info("runtime.session.triggered.started", {
+        sessionId: session.id,
+        scheduleId: schedule.schedule_id,
+      });
+      return await this.runTriggeredSession(session);
+    } catch (error) {
+      this.logger.error("runtime.session.triggered.start_failed", {
+        scheduleId: schedule.schedule_id,
+        error,
+      });
+      return false;
+    }
+  }
+
+  private async handleSessionFailure(
+    session: AgentSession,
+    error: unknown,
+    event: string,
+  ): Promise<void> {
+    this.sessionManager.failSession(session.id);
+    this.logger.error(event, {
+      sessionId: session.id,
+      triggerSource: session.triggerSource,
+      error,
+      providerUnavailable: error instanceof LLMProviderUnavailableError,
+    });
+    await this.safeNotifySession(session.id, buildRuntimeFailureNotice(session.triggerSource, error));
+  }
+
+  private async safeNotifySession(sessionId: string, content: string): Promise<void> {
+    try {
+      await this.adapter.send({
+        sessionId,
+        mode: "notify",
+        content,
+      });
+    } catch (error) {
+      this.logger.error("runtime.session.notify_failed", {
+        sessionId,
+        error,
+      });
+    }
+  }
+
   private ensureActiveSession(sessionId: string, action: string): AgentSession {
     const session = this.sessionManager.getSession(sessionId);
     if (!session || session.isTerminal()) {
@@ -754,14 +819,13 @@ export class AgentRuntime {
         this.sessionManager.completeSession(session.id);
       }
 
+      this.logger.info("runtime.session.triggered.completed", {
+        sessionId: session.id,
+      });
+
       return true;
     } catch (error) {
-      this.sessionManager.failSession(session.id);
-      await this.adapter.send({
-        sessionId: session.id,
-        mode: "notify",
-        content: `Runtime error: ${toErrorMessage(error)}`,
-      });
+      await this.handleSessionFailure(session, error, "runtime.session.triggered.failed");
       return false;
     }
   }
@@ -800,6 +864,16 @@ function toErrorMessage(error: unknown): string {
   }
 
   return String(error);
+}
+
+function buildRuntimeFailureNotice(triggerSource: AgentSession["triggerSource"], error: unknown): string {
+  if (error instanceof LLMProviderUnavailableError) {
+    return triggerSource === "schedule"
+      ? "Scheduled run failed because the language model is currently unavailable. Check the network connection or provider settings, then retry the schedule."
+      : "The language model is currently unavailable. Check the network connection or provider settings, then try again.";
+  }
+
+  return `Runtime error: ${toErrorMessage(error)}`;
 }
 
 function shouldAppendSpecRegisterFreshnessNote(toolName: string, toolResult: unknown): boolean {

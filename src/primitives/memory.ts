@@ -1,4 +1,7 @@
 import type { Database } from "bun:sqlite";
+import type { SqliteLockRetryOptions } from "../db/database.ts";
+import { withSqliteLockRetry } from "../db/database.ts";
+import type { Logger } from "../observability/logger.ts";
 import type { PrimitiveHandler, PrimitiveResult } from "./types.ts";
 
 const DEFAULT_SEARCH_LIMIT = 10;
@@ -21,6 +24,8 @@ interface SearchRow extends MemoryRow {
 
 interface MemoryHandlerOptions {
   getDatabase: () => Database;
+  sqliteLockRetry?: SqliteLockRetryOptions;
+  logger?: Logger;
 }
 
 export function createMemoryHandler(options: MemoryHandlerOptions): PrimitiveHandler {
@@ -29,23 +34,28 @@ export function createMemoryHandler(options: MemoryHandlerOptions): PrimitiveHan
       const operation = requireString(params.operation, "operation");
       const database = options.getDatabase();
 
-      switch (operation) {
-        case "get":
-          return handleGet(database, params);
-        case "set":
-          return handleSet(database, params);
-        case "search":
-          return handleSearch(database, params);
-        case "list":
-          return handleList(database, params);
-        case "delete":
-          return handleDelete(database, params);
-        default:
-          return {
-            success: false,
-            error: `Unsupported memory operation: ${operation}`,
-          };
-      }
+      return withSqliteLockRetry(`memory ${operation}`, () => {
+        switch (operation) {
+          case "get":
+            return handleGet(database, params);
+          case "set":
+            return handleSet(database, params);
+          case "search":
+            return handleSearch(database, params);
+          case "list":
+            return handleList(database, params);
+          case "delete":
+            return handleDelete(database, params);
+          default:
+            return {
+              success: false,
+              error: `Unsupported memory operation: ${operation}`,
+            };
+        }
+      }, {
+        ...options.sqliteLockRetry,
+        logger: options.sqliteLockRetry?.logger ?? options.logger,
+      });
     } catch (error) {
       return {
         success: false,

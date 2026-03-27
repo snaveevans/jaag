@@ -13,8 +13,9 @@ import {
   HARD_CEILING_UTILIZATION,
   planHistoryCompaction,
 } from "../context/budget.ts";
-import type { LLMProvider } from "../llm/provider.ts";
+import { LLMProviderUnavailableError, type LLMProvider } from "../llm/provider.ts";
 import type { InternalMessage, ModelConfig, StreamChunk, ToolDeclaration } from "../llm/types.ts";
+import { Logger } from "../observability/logger.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
 import type { PrimitiveContext, PrimitiveResult } from "../primitives/types.ts";
 import type { TriggeredScheduleContext } from "../scheduler/types.ts";
@@ -726,6 +727,16 @@ class CompactionAwareProvider implements LLMProvider {
   }
 }
 
+class UnavailableProvider implements LLMProvider {
+  async *stream(
+    _messages: InternalMessage[],
+    _tools: ToolDeclaration[],
+    _config: ModelConfig,
+  ): AsyncIterable<StreamChunk> {
+    throw new LLMProviderUnavailableError("Provider offline.");
+  }
+}
+
 class SeededTriggeredSessionManager extends SessionManager {
   constructor(
     private readonly seedMessages: InternalMessage[],
@@ -738,6 +749,19 @@ class SeededTriggeredSessionManager extends SessionManager {
     const session = await super.createTriggeredSession(triggeredSchedule, now);
     seedSession(session, this.seedMessages);
     return session;
+  }
+}
+
+class RecordingFailureSessionManager extends SessionManager {
+  failedSessions: AgentSession[] = [];
+
+  override failSession(sessionId: string, at = new Date()): void {
+    const session = this.getSession(sessionId);
+    if (session) {
+      this.failedSessions.push(session);
+    }
+
+    super.failSession(sessionId, at);
   }
 }
 
@@ -2198,6 +2222,252 @@ describe("AgentRuntime", () => {
       await runtime.shutdown(1000);
     }
   });
+
+  test("surfaces provider outages to interactive users and keeps the runtime alive", async () => {
+    const { parsed, sink } = createCaptureSink();
+    const adapter = new FakeAdapter();
+    const provider = new UnavailableProvider();
+    const sessionManager = new RecordingFailureSessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig(),
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-provider-unavailable-${crypto.randomUUID()}`),
+      }),
+      logger: new Logger({ sink }),
+    });
+
+    runtime.start();
+
+    try {
+      adapter.dispatchInbound("hello");
+
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+        mode: "notify",
+        content: "The language model is currently unavailable. Check the network connection or provider settings, then try again.",
+      }));
+      expect(sessionManager.failedSessions).toHaveLength(1);
+      expect(sessionManager.failedSessions[0]?.status).toBe("failed");
+      expect(sessionManager.getInteractiveSession()).toBeNull();
+
+      expect(parsed()).toContainEqual(expect.objectContaining({
+        level: "error",
+        event: "runtime.session.interactive.failed",
+        component: "runtime.agent",
+        sessionId: sessionManager.failedSessions[0]?.id,
+        triggerSource: "user",
+        providerUnavailable: true,
+        error: expect.objectContaining({
+          name: "LLMProviderUnavailableError",
+          message: "Provider offline.",
+        }),
+      }));
+
+      adapter.dispatchInbound("retry");
+
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(
+        adapter.sentMessages.filter((message) => {
+          return message.mode === "notify"
+            && message.content === "The language model is currently unavailable. Check the network connection or provider settings, then try again.";
+        }),
+      ).toHaveLength(2);
+      expect(sessionManager.failedSessions).toHaveLength(2);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("marks triggered sessions failed on provider outages and keeps processing later work", async () => {
+    const { parsed, sink } = createCaptureSink();
+    const adapter = new FakeAdapter();
+    let callCount = 0;
+    const provider: LLMProvider = {
+      async *stream(
+        messages: InternalMessage[],
+        _tools: ToolDeclaration[],
+        _config: ModelConfig,
+      ): AsyncIterable<StreamChunk> {
+        callCount += 1;
+
+        if (callCount === 1) {
+          throw new LLMProviderUnavailableError("Provider offline.");
+        }
+
+        const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
+        yield { type: "text", content: `reply:${latestUserMessage?.content ?? ""}` };
+        yield { type: "done" };
+      },
+    };
+    const sessionManager = new RecordingFailureSessionManager({
+      buildSystemPrompt: ({ now, triggeredSchedule }) => buildTriggeredSystemPrompt(now, triggeredSchedule),
+    });
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig(),
+      sessionManager,
+      primitiveDispatcher: new PrimitiveDispatcher({
+        workspaceDir: join(tmpdir(), `agent-runtime-trigger-provider-unavailable-${crypto.randomUUID()}`),
+      }),
+      logger: new Logger({ sink }),
+    });
+
+    runtime.start();
+
+    try {
+      const success = await runtime.launchTriggeredSchedule({
+        schedule_id: "schedule-provider-unavailable",
+        workflow: "hydration",
+        group: null,
+        trigger: { type: "once", at: "2026-03-22T10:05:00.000Z" },
+        context: { instruction: "Run the scheduled reminder." },
+        instruction: "Run the scheduled reminder.",
+      });
+
+      expect(success).toBe(false);
+      expect(sessionManager.failedSessions).toHaveLength(1);
+      expect(sessionManager.failedSessions[0]?.status).toBe("failed");
+      expect(adapter.sentMessages).toContainEqual(expect.objectContaining({
+        sessionId: sessionManager.failedSessions[0]?.id,
+        mode: "notify",
+        content: "Scheduled run failed because the language model is currently unavailable. Check the network connection or provider settings, then retry the schedule.",
+      }));
+      expect(parsed()).toContainEqual(expect.objectContaining({
+        level: "error",
+        event: "runtime.session.triggered.failed",
+        component: "runtime.agent",
+        sessionId: sessionManager.failedSessions[0]?.id,
+        triggerSource: "schedule",
+        providerUnavailable: true,
+        error: expect.objectContaining({
+          name: "LLMProviderUnavailableError",
+          message: "Provider offline.",
+        }),
+      }));
+
+      adapter.dispatchInbound("follow-up after outage");
+
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(callCount).toBe(2);
+      expect(adapter.streamChunks).toEqual([
+        {
+          sessionId: sessionManager.getInteractiveSession()!.id,
+          content: "reply:follow-up after outage",
+        },
+      ]);
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
+
+  test("logs compaction summary persistence throws and continues", async () => {
+    const { parsed, sink } = createCaptureSink();
+    const rootDir = await mkdtemp(join(tmpdir(), "agent-runtime-compaction-persist-throw-"));
+    tempDirs.push(rootDir);
+
+    const agentHome = join(rootDir, ".agent");
+    const workspaceDir = join(rootDir, "workspace");
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(workspaceDir, { recursive: true });
+
+    const adapter = new FakeAdapter();
+    class ThrowingSummaryMemoryDispatcher extends PrimitiveDispatcher {
+      override async dispatch(
+        primitiveName: string,
+        params: Record<string, unknown>,
+        context: PrimitiveContext,
+      ): Promise<PrimitiveResult> {
+        if (
+          primitiveName === "memory"
+          && params.operation === "set"
+          && params.domain === null
+          && typeof params.key === "string"
+          && params.key.startsWith("session_summary:")
+        ) {
+          throw new Error("Injected compaction summary persistence throw.");
+        }
+
+        return await super.dispatch(primitiveName, params, context);
+      }
+    }
+    const dispatcher = new ThrowingSummaryMemoryDispatcher({ agentHome, workspaceDir });
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: () => "system prompt",
+    });
+    const session = await sessionManager.getOrCreateInteractiveSession(new Date("2026-03-22T00:00:00.000Z"));
+    seedSession(session, buildSeedMessages());
+
+    const finalUserMessage = "latest request that should still continue after a thrown persistence failure";
+    const futureMessages = [...session.messages, { role: "user", content: finalUserMessage } satisfies InternalMessage];
+    const compactionPlan = planHistoryCompaction(futureMessages);
+    expect(compactionPlan).not.toBeNull();
+
+    const summaryText = "Older repo and user context that still matters.";
+    const postCompactionMessages = buildCompactedMessageHistory(
+      futureMessages,
+      compactionPlan!.keepStartIndex,
+      buildCompactionSummaryMessage(summaryText),
+    );
+    const toolTokens = estimateToolDeclarationsTokens(dispatcher.getToolDeclarations());
+    const preUsedTokens = estimateMessagesTokens(futureMessages) + toolTokens;
+    const postUsedTokens = estimateMessagesTokens(postCompactionMessages) + toolTokens;
+    const contextLimit = findContextLimit(preUsedTokens, postUsedTokens, "continue_after_compaction");
+
+    const provider = new CompactionAwareProvider(summaryText, "Compacted reply complete.");
+    const runtime = new AgentRuntime({
+      adapter,
+      llmProvider: provider,
+      modelConfig: createModelConfig({ contextLimit }),
+      sessionManager,
+      primitiveDispatcher: dispatcher,
+      logger: new Logger({ sink }),
+    });
+
+    runtime.start();
+    adapter.dispatchInbound(finalUserMessage);
+
+    try {
+      expect(await runtime.waitForIdle(1000)).toBe(true);
+      expect(provider.summaryCallCount).toBe(1);
+      expect(provider.normalCallCount).toBe(1);
+      expect(adapter.streamChunks).toEqual([
+        { sessionId: session.id, content: "Compacted reply complete." },
+      ]);
+      expect(parsed()).toContainEqual(expect.objectContaining({
+        level: "warn",
+        event: "runtime.compaction.persist_failed",
+        component: "runtime.agent",
+        sessionId: session.id,
+        error: expect.objectContaining({
+          name: "Error",
+          message: "Injected compaction summary persistence throw.",
+        }),
+      }));
+
+      const memoryEntries = await dispatcher.dispatch(
+        "memory",
+        {
+          operation: "list",
+          domain: null,
+        },
+        { sessionId: "memory-check" },
+      );
+      expect(memoryEntries).toMatchObject({
+        success: true,
+        data: {
+          entries: [],
+        },
+      });
+    } finally {
+      await runtime.shutdown(1000);
+    }
+  });
 });
 
 async function waitForCondition(
@@ -2321,4 +2591,17 @@ function findContextLimit(
   }
 
   throw new Error(`Unable to find a context limit for ${mode}.`);
+}
+
+function createCaptureSink() {
+  const lines: string[] = [];
+  return {
+    sink: {
+      write(line: string) {
+        lines.push(line);
+      },
+    },
+    lines,
+    parsed: () => lines.map((line) => JSON.parse(line.trim()) as Record<string, unknown>),
+  };
 }

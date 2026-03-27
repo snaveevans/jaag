@@ -1,4 +1,7 @@
 import type { Database } from "bun:sqlite";
+import type { SqliteLockRetryOptions } from "../db/database.ts";
+import { withSqliteLockRetry } from "../db/database.ts";
+import type { Logger } from "../observability/logger.ts";
 import { assertSupportedScheduleTriggerType, computeNextCronOccurrence, parseCronExpression } from "./cron.ts";
 import type {
   ScheduleContextPayload,
@@ -46,29 +49,108 @@ export interface ScheduleStoreOptions {
   database: Database;
   timeZone?: string;
   now?: () => Date;
+  sqliteLockRetry?: SqliteLockRetryOptions;
+  logger?: Logger;
 }
 
 export class ScheduleStore {
   private readonly database: Database;
   private readonly timeZone: string;
   private readonly now: () => Date;
+  private readonly sqliteLockRetry?: SqliteLockRetryOptions;
+  private readonly logger?: Logger;
 
   constructor(options: ScheduleStoreOptions) {
     this.database = options.database;
     this.timeZone = options.timeZone ?? "UTC";
     this.now = options.now ?? (() => new Date());
+    this.sqliteLockRetry = options.sqliteLockRetry;
+    this.logger = options.logger;
   }
 
   create(input: CreateScheduleInput): ScheduleRecord {
-    const now = this.now();
-    const nowIso = now.toISOString();
-    const triggerState = computeTriggerState(input.trigger, now, this.timeZone, input.status ?? "active");
-    const scheduleId = crypto.randomUUID();
-    const status = input.status ?? "active";
+    return this.withDatabaseRetry("schedule create", () => {
+      const now = this.now();
+      const nowIso = now.toISOString();
+      const triggerState = computeTriggerState(input.trigger, now, this.timeZone, input.status ?? "active");
+      const scheduleId = crypto.randomUUID();
+      const status = input.status ?? "active";
 
-    this.database.run(
-      `
-        INSERT INTO schedules (
+      this.database.run(
+        `
+          INSERT INTO schedules (
+            id,
+            workflow,
+            group_label,
+            trigger_type,
+            trigger_config,
+            context,
+            status,
+            created_at,
+            updated_at,
+            last_fired_at,
+            next_fire_at,
+            fire_count,
+            last_fire_status
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          scheduleId,
+          input.workflow,
+          input.group ?? null,
+          input.trigger.type,
+          JSON.stringify(serializeTriggerConfig(input.trigger)),
+          JSON.stringify(input.context),
+          status,
+          nowIso,
+          nowIso,
+          null,
+          triggerState.next_fire_at,
+          0,
+          null,
+        ],
+      );
+
+      const created = this.getByIdInternal(scheduleId);
+      if (!created) {
+        throw new Error(`Failed to load created schedule ${scheduleId}.`);
+      }
+
+      return created;
+    });
+  }
+
+  getById(scheduleId: string): ScheduleRecord | null {
+    return this.withDatabaseRetry("schedule get", () => this.getByIdInternal(scheduleId));
+  }
+
+  list(filters: ScheduleListFilters = {}): ScheduleRecord[] {
+    return this.withDatabaseRetry("schedule list", () => {
+      const clauses: string[] = [];
+      const values: unknown[] = [];
+
+      if (filters.workflow !== undefined) {
+        clauses.push("workflow = ?");
+        values.push(filters.workflow);
+      }
+
+      if (filters.group !== undefined) {
+        clauses.push("group_label = ?");
+        values.push(filters.group);
+      }
+
+      if (filters.status !== undefined) {
+        clauses.push("status = ?");
+        values.push(filters.status);
+      }
+
+      if (filters.trigger_type !== undefined) {
+        clauses.push("trigger_type = ?");
+        values.push(filters.trigger_type);
+      }
+
+      const sql = `
+        SELECT
           id,
           workflow,
           group_label,
@@ -82,34 +164,189 @@ export class ScheduleStore {
           next_fire_at,
           fire_count,
           last_fire_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-      [
-        scheduleId,
-        input.workflow,
-        input.group ?? null,
-        input.trigger.type,
-        JSON.stringify(serializeTriggerConfig(input.trigger)),
-        JSON.stringify(input.context),
-        status,
-        nowIso,
-        nowIso,
-        null,
-        triggerState.next_fire_at,
-        0,
-        null,
-      ],
-    );
+        FROM schedules
+        ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
+        ORDER BY created_at ASC, id ASC
+      `;
 
-    const created = this.getById(scheduleId);
-    if (!created) {
-      throw new Error(`Failed to load created schedule ${scheduleId}.`);
-    }
-
-    return created;
+      return this.database.query<ScheduleRow, any[]>(sql).all(...values).map(mapScheduleRow);
+    });
   }
 
-  getById(scheduleId: string): ScheduleRecord | null {
+  update(scheduleId: string, input: UpdateScheduleInput): ScheduleRecord | null {
+    return this.withDatabaseRetry("schedule update", () => {
+      const current = this.getByIdInternal(scheduleId);
+      if (!current) {
+        return null;
+      }
+
+      const nextTrigger = input.trigger ?? current.trigger;
+      const nextStatus = input.status ?? current.status;
+      const nextContext = input.context ?? current.context;
+      const nextWorkflow = input.workflow ?? current.workflow;
+      const nextGroup = input.group === undefined ? current.group : input.group;
+      const now = this.now();
+      const nowIso = now.toISOString();
+      const triggerState = shouldPreserveNextFireAt(current, nextTrigger, nextStatus)
+        ? { next_fire_at: current.next_fire_at }
+        : computeTriggerState(nextTrigger, now, this.timeZone, nextStatus, current.next_fire_at);
+
+      this.database.run(
+        `
+          UPDATE schedules
+          SET workflow = ?,
+              group_label = ?,
+              trigger_type = ?,
+              trigger_config = ?,
+              context = ?,
+              status = ?,
+              updated_at = ?,
+              next_fire_at = ?
+          WHERE id = ?
+        `,
+        [
+          nextWorkflow,
+          nextGroup ?? null,
+          nextTrigger.type,
+          JSON.stringify(serializeTriggerConfig(nextTrigger)),
+          JSON.stringify(nextContext),
+          nextStatus,
+          nowIso,
+          triggerState.next_fire_at,
+          scheduleId,
+        ],
+      );
+
+      return this.getByIdInternal(scheduleId);
+    });
+  }
+
+  deleteById(scheduleId: string): number {
+    return this.withDatabaseRetry("schedule delete by id", () => {
+      return this.database.run("DELETE FROM schedules WHERE id = ?", [scheduleId]).changes;
+    });
+  }
+
+  deleteByGroup(group: string): number {
+    return this.withDatabaseRetry("schedule delete by group", () => {
+      return this.database.run("DELETE FROM schedules WHERE group_label = ?", [group]).changes;
+    });
+  }
+
+  listDueScheduleIds(now = this.now()): string[] {
+    return this.withDatabaseRetry("schedule list due ids", () => {
+      const nowIso = now.toISOString();
+      return this.database
+        .query<{ id: string }, [string]>(`
+          SELECT id
+          FROM schedules
+          WHERE status = 'active'
+            AND next_fire_at IS NOT NULL
+            AND next_fire_at <= ?
+          ORDER BY next_fire_at ASC, id ASC
+        `)
+        .all(nowIso)
+        .map((row) => row.id);
+    });
+  }
+
+  advanceForExecution(scheduleId: string, firedAt = this.now()): ScheduleRecord | null {
+    return this.withDatabaseRetry("schedule advance for execution", () => {
+      const advance = this.database.transaction((targetId: string, targetTimeIso: string) => {
+        const row = this.database
+          .query<ScheduleRow, [string]>(`
+            SELECT
+              id,
+              workflow,
+              group_label,
+              trigger_type,
+              trigger_config,
+              context,
+              status,
+              created_at,
+              updated_at,
+              last_fired_at,
+              next_fire_at,
+              fire_count,
+              last_fire_status
+            FROM schedules
+            WHERE id = ?
+            LIMIT 1
+          `)
+          .get(targetId);
+
+        if (!row) {
+          return null;
+        }
+
+        const schedule = mapScheduleRow(row);
+        if (schedule.status !== "active") {
+          return null;
+        }
+
+        if (!schedule.next_fire_at || schedule.next_fire_at > targetTimeIso) {
+          return null;
+        }
+
+        const advancedState = computeExecutionAdvance(schedule, firedAt, this.timeZone);
+        this.database.run(
+          `
+            UPDATE schedules
+            SET status = ?,
+                updated_at = ?,
+                last_fired_at = ?,
+                next_fire_at = ?,
+                fire_count = ?,
+                last_fire_status = ?
+            WHERE id = ?
+          `,
+          [
+            advancedState.status,
+            targetTimeIso,
+            targetTimeIso,
+            advancedState.next_fire_at,
+            schedule.fire_count + 1,
+            null,
+            targetId,
+          ],
+        );
+
+        return this.getByIdInternal(targetId);
+      });
+
+      return advance(scheduleId, firedAt.toISOString());
+    });
+  }
+
+  recordExecutionResult(
+    scheduleId: string,
+    executionStatus: ScheduleLastFireStatus,
+    at = this.now(),
+  ): void {
+    this.withDatabaseRetry("schedule record execution result", () => {
+      this.database.run(
+        "UPDATE schedules SET last_fire_status = ?, updated_at = ? WHERE id = ?",
+        [executionStatus, at.toISOString(), scheduleId],
+      );
+    });
+  }
+
+  reconcileInterruptedExecutions(at = this.now()): number {
+    return this.withDatabaseRetry("schedule reconcile interrupted executions", () => {
+      return this.database.run(
+        `
+          UPDATE schedules
+          SET last_fire_status = 'failed',
+              updated_at = ?
+          WHERE last_fire_status IS NULL
+            AND last_fired_at IS NOT NULL
+        `,
+        [at.toISOString()],
+      ).changes;
+    });
+  }
+
+  private getByIdInternal(scheduleId: string): ScheduleRecord | null {
     const row = this.database
       .query<ScheduleRow, [string]>(`
         SELECT
@@ -135,210 +372,11 @@ export class ScheduleStore {
     return row ? mapScheduleRow(row) : null;
   }
 
-  list(filters: ScheduleListFilters = {}): ScheduleRecord[] {
-    const clauses: string[] = [];
-    const values: unknown[] = [];
-
-    if (filters.workflow !== undefined) {
-      clauses.push("workflow = ?");
-      values.push(filters.workflow);
-    }
-
-    if (filters.group !== undefined) {
-      clauses.push("group_label = ?");
-      values.push(filters.group);
-    }
-
-    if (filters.status !== undefined) {
-      clauses.push("status = ?");
-      values.push(filters.status);
-    }
-
-    if (filters.trigger_type !== undefined) {
-      clauses.push("trigger_type = ?");
-      values.push(filters.trigger_type);
-    }
-
-    const sql = `
-      SELECT
-        id,
-        workflow,
-        group_label,
-        trigger_type,
-        trigger_config,
-        context,
-        status,
-        created_at,
-        updated_at,
-        last_fired_at,
-        next_fire_at,
-        fire_count,
-        last_fire_status
-      FROM schedules
-      ${clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : ""}
-      ORDER BY created_at ASC, id ASC
-    `;
-
-    return this.database.query<ScheduleRow, any[]>(sql).all(...values).map(mapScheduleRow);
-  }
-
-  update(scheduleId: string, input: UpdateScheduleInput): ScheduleRecord | null {
-    const current = this.getById(scheduleId);
-    if (!current) {
-      return null;
-    }
-
-    const nextTrigger = input.trigger ?? current.trigger;
-    const nextStatus = input.status ?? current.status;
-    const nextContext = input.context ?? current.context;
-    const nextWorkflow = input.workflow ?? current.workflow;
-    const nextGroup = input.group === undefined ? current.group : input.group;
-    const now = this.now();
-    const nowIso = now.toISOString();
-    const triggerState = shouldPreserveNextFireAt(current, nextTrigger, nextStatus)
-      ? { next_fire_at: current.next_fire_at }
-      : computeTriggerState(nextTrigger, now, this.timeZone, nextStatus, current.next_fire_at);
-
-    this.database.run(
-      `
-        UPDATE schedules
-        SET workflow = ?,
-            group_label = ?,
-            trigger_type = ?,
-            trigger_config = ?,
-            context = ?,
-            status = ?,
-            updated_at = ?,
-            next_fire_at = ?
-        WHERE id = ?
-      `,
-      [
-        nextWorkflow,
-        nextGroup ?? null,
-        nextTrigger.type,
-        JSON.stringify(serializeTriggerConfig(nextTrigger)),
-        JSON.stringify(nextContext),
-        nextStatus,
-        nowIso,
-        triggerState.next_fire_at,
-        scheduleId,
-      ],
-    );
-
-    return this.getById(scheduleId);
-  }
-
-  deleteById(scheduleId: string): number {
-    return this.database.run("DELETE FROM schedules WHERE id = ?", [scheduleId]).changes;
-  }
-
-  deleteByGroup(group: string): number {
-    return this.database.run("DELETE FROM schedules WHERE group_label = ?", [group]).changes;
-  }
-
-  listDueScheduleIds(now = this.now()): string[] {
-    const nowIso = now.toISOString();
-    return this.database
-      .query<{ id: string }, [string]>(`
-        SELECT id
-        FROM schedules
-        WHERE status = 'active'
-          AND next_fire_at IS NOT NULL
-          AND next_fire_at <= ?
-        ORDER BY next_fire_at ASC, id ASC
-      `)
-      .all(nowIso)
-      .map((row) => row.id);
-  }
-
-  advanceForExecution(scheduleId: string, firedAt = this.now()): ScheduleRecord | null {
-    const advance = this.database.transaction((targetId: string, targetTimeIso: string) => {
-      const row = this.database
-        .query<ScheduleRow, [string]>(`
-          SELECT
-            id,
-            workflow,
-            group_label,
-            trigger_type,
-            trigger_config,
-            context,
-            status,
-            created_at,
-            updated_at,
-            last_fired_at,
-            next_fire_at,
-            fire_count,
-            last_fire_status
-          FROM schedules
-          WHERE id = ?
-          LIMIT 1
-        `)
-        .get(targetId);
-
-      if (!row) {
-        return null;
-      }
-
-      const schedule = mapScheduleRow(row);
-      if (schedule.status !== "active") {
-        return null;
-      }
-
-      if (!schedule.next_fire_at || schedule.next_fire_at > targetTimeIso) {
-        return null;
-      }
-
-      const advancedState = computeExecutionAdvance(schedule, firedAt, this.timeZone);
-      this.database.run(
-        `
-          UPDATE schedules
-          SET status = ?,
-              updated_at = ?,
-              last_fired_at = ?,
-              next_fire_at = ?,
-              fire_count = ?,
-              last_fire_status = ?
-          WHERE id = ?
-        `,
-        [
-          advancedState.status,
-          targetTimeIso,
-          targetTimeIso,
-          advancedState.next_fire_at,
-          schedule.fire_count + 1,
-          null,
-          targetId,
-        ],
-      );
-
-      return this.getById(targetId);
+  private withDatabaseRetry<T>(operationName: string, action: () => T): T {
+    return withSqliteLockRetry(operationName, action, {
+      ...this.sqliteLockRetry,
+      logger: this.sqliteLockRetry?.logger ?? this.logger,
     });
-
-    return advance(scheduleId, firedAt.toISOString());
-  }
-
-  recordExecutionResult(
-    scheduleId: string,
-    executionStatus: ScheduleLastFireStatus,
-    at = this.now(),
-  ): void {
-    this.database.run(
-      "UPDATE schedules SET last_fire_status = ?, updated_at = ? WHERE id = ?",
-      [executionStatus, at.toISOString(), scheduleId],
-    );
-  }
-
-  reconcileInterruptedExecutions(at = this.now()): number {
-    return this.database.run(
-      `
-        UPDATE schedules
-        SET last_fire_status = 'failed',
-            updated_at = ?
-        WHERE last_fire_status IS NULL
-          AND last_fired_at IS NOT NULL
-      `,
-      [at.toISOString()],
-    ).changes;
   }
 }
 

@@ -1,4 +1,5 @@
 import type { Database } from "bun:sqlite";
+import type { Logger } from "../observability/logger.ts";
 import type { PrimitiveHandler, PrimitiveResult } from "./types.ts";
 import { ScheduleStore, type CreateScheduleInput, type UpdateScheduleInput } from "../scheduler/store.ts";
 import type {
@@ -13,6 +14,7 @@ interface ScheduleHandlerOptions {
   getDatabase: () => Database;
   timeZone?: string;
   now?: () => Date;
+  logger?: Logger;
 }
 
 export function createScheduleHandler(options: ScheduleHandlerOptions): PrimitiveHandler {
@@ -20,6 +22,7 @@ export function createScheduleHandler(options: ScheduleHandlerOptions): Primitiv
     database: options.getDatabase(),
     timeZone: options.timeZone,
     now: options.now,
+    logger: options.logger,
   });
 
   return async (params) => {
