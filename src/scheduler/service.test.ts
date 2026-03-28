@@ -3,7 +3,14 @@ import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
+import type {
+  CommandResponse,
+  CommunicationAdapter,
+  DeliveryResult,
+  InboundCommand,
+  InboundMessage,
+  OutboundMessage,
+} from "../communication/adapter.ts";
 import { runDatabaseMigrations } from "../db/migrations.ts";
 import { OpenAICompatibleProvider } from "../llm/openai.ts";
 import { PrimitiveDispatcher } from "../primitives/dispatcher.ts";
@@ -47,6 +54,8 @@ class RecordingAdapter implements CommunicationAdapter {
   onMessage(handler: (message: InboundMessage) => void): void {
     this.handler = handler;
   }
+
+  onCommand(_handler: (command: InboundCommand) => Promise<CommandResponse>): void {}
 
   isConnected(): boolean {
     return true;

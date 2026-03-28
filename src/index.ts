@@ -12,6 +12,7 @@ import { closeDatabase, getDatabase } from "./db/database.ts";
 import { resolveExecuteWorkspaceDir } from "./config/schema.ts";
 import { createContinuityAwareSystemPromptBuilder } from "./continuity/prompt.ts";
 import { Logger, createFileLogSink } from "./observability/logger.ts";
+import { createCommandHandler } from "./commands/handler.ts";
 
 async function main(): Promise<void> {
   const agentHome = resolveAgentHome();
@@ -66,6 +67,15 @@ async function main(): Promise<void> {
         workspace: process.cwd(),
       },
     });
+
+    const startedAt = new Date();
+    const handleCommand = createCommandHandler({
+      config,
+      primitiveDispatcher,
+      startedAt,
+      getConnectionState: () => ({ connected: adapter!.isConnected() }),
+    });
+    adapter.onCommand(handleCommand);
     await adapter.start();
 
     runtime = new AgentRuntime({

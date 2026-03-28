@@ -1,5 +1,12 @@
 import type { ServerWebSocket } from "bun";
-import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "./adapter.ts";
+import type {
+  CommandResponse,
+  CommunicationAdapter,
+  DeliveryResult,
+  InboundCommand,
+  InboundMessage,
+  OutboundMessage,
+} from "./adapter.ts";
 import { Logger } from "../observability/logger.ts";
 
 interface WebSocketAdapterOptions {
@@ -27,11 +34,13 @@ type QueuedEventInput =
 
 type ClientEnvelope =
   | { type: "message"; content: string; replyToPromptId?: string; reply_to_prompt_id?: string }
+  | { type: "command"; command: string; args?: string[] }
   | { type: string; [key: string]: unknown };
 
 type ServerEnvelope =
   | ({ type: "message" } & OutboundMessage)
-  | { type: "stream_chunk"; sessionId: string; content: string };
+  | { type: "stream_chunk"; sessionId: string; content: string }
+  | { type: "command_response"; command: string; data: unknown; error?: string };
 
 export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   private readonly port: number;
@@ -45,6 +54,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   private server?: Bun.Server<undefined>;
   private socket: ServerWebSocket<undefined> | null = null;
   private messageHandler: ((message: InboundMessage) => void) | null = null;
+  private commandHandler: ((command: InboundCommand) => Promise<CommandResponse>) | null = null;
 
   constructor(options: WebSocketAdapterOptions) {
     this.port = options.port;
@@ -91,7 +101,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
           void this.flushQueuedEvents();
         },
-        message: (_socket, message) => {
+        message: (socket, message) => {
           const text = normalizeWebSocketPayload(message);
           if (!text) {
             return;
@@ -107,22 +117,32 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
             return;
           }
 
-          if (
-            typeof envelope !== "object"
-            || envelope === null
-            || envelope.type !== "message"
-            || typeof envelope.content !== "string"
-          ) {
+          if (typeof envelope !== "object" || envelope === null) {
             this.logger.warn("websocket.inbound.unsupported", {
-              envelopeType: typeof envelope === "object" && envelope !== null ? envelope.type : undefined,
+              envelopeType: undefined,
             });
             return;
           }
 
-          this.messageHandler?.({
-            content: envelope.content,
-            timestamp: new Date(),
-            replyToPromptId: getReplyToPromptId(envelope),
+          if (envelope.type === "message" && typeof envelope.content === "string") {
+            this.messageHandler?.({
+              content: envelope.content,
+              timestamp: new Date(),
+              replyToPromptId: getReplyToPromptId(envelope),
+            });
+            return;
+          }
+
+          if (envelope.type === "command" && typeof envelope.command === "string") {
+            void this.handleCommand(socket, {
+              command: envelope.command,
+              args: getCommandArgs(envelope),
+            });
+            return;
+          }
+
+          this.logger.warn("websocket.inbound.unsupported", {
+            envelopeType: envelope.type,
           });
         },
         close: (socket) => {
@@ -165,6 +185,10 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
     this.messageHandler = handler;
   }
 
+  onCommand(handler: (command: InboundCommand) => Promise<CommandResponse>): void {
+    this.commandHandler = handler;
+  }
+
   isConnected(): boolean {
     return this.socket !== null;
   }
@@ -175,6 +199,21 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
   getUrl(): string {
     return `ws://${this.hostname}:${this.getPort()}`;
+  }
+
+  private async handleCommand(socket: ServerWebSocket<undefined>, command: InboundCommand): Promise<void> {
+    try {
+      const response = this.commandHandler
+        ? await this.commandHandler(command)
+        : { data: null, error: "Commands not supported" };
+
+      this.sendCommandResponse(socket, command.command, response);
+    } catch (error) {
+      this.sendCommandResponse(socket, command.command, {
+        data: null,
+        error: toErrorMessage(error),
+      });
+    }
   }
 
   private async enqueueOrSend(event: QueuedEvent): Promise<DeliveryResult> {
@@ -281,6 +320,30 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
     return event;
   }
+
+  private sendCommandResponse(
+    socket: ServerWebSocket<undefined>,
+    command: string,
+    response: CommandResponse,
+  ): void {
+    try {
+      socket.send(JSON.stringify({
+        type: "command_response",
+        command,
+        data: response.data,
+        ...(response.error ? { error: response.error } : {}),
+      } satisfies ServerEnvelope));
+    } catch (error) {
+      if (this.socket === socket) {
+        this.socket = null;
+      }
+
+      this.logger.warn("websocket.command_response.failed", {
+        command,
+        error: toErrorMessage(error),
+      });
+    }
+  }
 }
 
 function toServerEnvelope(event: QueuedEvent): ServerEnvelope {
@@ -337,6 +400,14 @@ function getReplyToPromptId(envelope: ClientEnvelope): string | undefined {
   return undefined;
 }
 
+function getCommandArgs(envelope: ClientEnvelope): string[] | undefined {
+  if (!("args" in envelope) || !Array.isArray(envelope.args) || envelope.args.some((value) => typeof value !== "string")) {
+    return undefined;
+  }
+
+  return envelope.args;
+}
+
 function createDeliveryDeferred(): DeliveryDeferred {
   let resolve!: () => void;
   let reject!: (error: Error) => void;
@@ -360,4 +431,12 @@ function normalizeWebSocketPayload(payload: string | ArrayBuffer | Uint8Array): 
   }
 
   return new TextDecoder().decode(payload);
+}
+
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
 }
