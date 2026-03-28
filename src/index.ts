@@ -68,12 +68,30 @@ async function main(): Promise<void> {
       },
     });
 
+    const sessionManager = new SessionManager({
+      buildSystemPrompt: createContinuityAwareSystemPromptBuilder({
+        getDatabase: () => database,
+        getPolicySummary: () => primitiveDispatcher.getPolicySummary(),
+        getToolManifests: () => primitiveDispatcher.listToolManifests(),
+        timeZone: config.runtime.timezone,
+        logger: baseLogger,
+      }),
+    });
+    const scheduleStore = new ScheduleStore({
+      database,
+      timeZone: config.runtime.timezone,
+      logger: baseLogger,
+    });
+
     const startedAt = new Date();
     const handleCommand = createCommandHandler({
       config,
       primitiveDispatcher,
       startedAt,
       getConnectionState: () => ({ connected: adapter!.isConnected() }),
+      scheduleStore,
+      sessionManager,
+      database,
     });
     adapter.onCommand(handleCommand);
     await adapter.start();
@@ -82,26 +100,14 @@ async function main(): Promise<void> {
       adapter,
       llmProvider: new OpenAICompatibleProvider({ logger: baseLogger }),
       modelConfig: config.llm,
-      sessionManager: new SessionManager({
-        buildSystemPrompt: createContinuityAwareSystemPromptBuilder({
-          getDatabase: () => database,
-          getPolicySummary: () => primitiveDispatcher.getPolicySummary(),
-          getToolManifests: () => primitiveDispatcher.listToolManifests(),
-          timeZone: config.runtime.timezone,
-          logger: baseLogger,
-        }),
-      }),
+      sessionManager,
       primitiveDispatcher,
       logger: baseLogger,
     });
     runtime.start();
 
     scheduler = new SchedulerService({
-      store: new ScheduleStore({
-        database,
-        timeZone: config.runtime.timezone,
-        logger: baseLogger,
-      }),
+      store: scheduleStore,
       launchSchedule: async (schedule, firedAt) => await runtime!.launchTriggeredSchedule(schedule, firedAt),
       logger: baseLogger,
     });
