@@ -4,6 +4,10 @@
 >
 > For the canonical list of all six original scenarios, see [scenarios.md](./scenarios.md). This document is intentionally narrower: it records only the scenarios that were stress-tested in depth here. Scenario 4 has its deeper execution trace in `docs/architecture.md`, and Scenario 2 does not yet have a dedicated deep-dive writeup.
 
+Related ADRs:
+- `docs/decisions/ADR-0004-use-sqlite-fts5-memory-with-keyed-and-fuzzy-access.md`
+- `docs/decisions/ADR-0005-run-scheduled-work-as-full-agent-sessions.md`
+
 ---
 
 ## Scenarios Status

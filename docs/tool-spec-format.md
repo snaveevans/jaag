@@ -2,6 +2,11 @@
 
 > **Purpose:** A declarative JSON format for describing external tools so that an AI agent can read the spec, understand the interface, and execute operations using the 7 primitives — without any hand-coded integration logic.
 
+Related ADRs:
+- `docs/decisions/ADR-0002-describe-tools-declaratively-and-handle-auth-as-runtime-middleware.md`
+- `docs/decisions/ADR-0003-enforce-safety-outside-agent-controlled-specs.md`
+- `docs/decisions/ADR-0004-use-sqlite-fts5-memory-with-keyed-and-fuzzy-access.md`
+
 ---
 
 ## Design Principles
