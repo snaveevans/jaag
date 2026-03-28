@@ -8,6 +8,7 @@ interface WebSocketAdapterOptions {
   maxBufferedMessages?: number;
   maxBufferedBytes?: number;
   logger?: Logger;
+  helloPayload?: Record<string, unknown>;
 }
 
 interface DeliveryDeferred {
@@ -38,6 +39,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
   private readonly maxBufferedMessages: number;
   private readonly maxBufferedBytes: number;
   private readonly logger: Logger;
+  private readonly helloPayload: Record<string, unknown> | null;
   private readonly outboundQueue: QueuedEvent[] = [];
   private outboundQueueBytes = 0;
   private server?: Bun.Server<undefined>;
@@ -49,6 +51,7 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
     this.hostname = options.hostname ?? "127.0.0.1";
     this.maxBufferedMessages = options.maxBufferedMessages ?? 100;
     this.maxBufferedBytes = options.maxBufferedBytes ?? 1024 * 1024;
+    this.helloPayload = options.helloPayload ?? null;
     this.logger = (options.logger ?? new Logger()).child({ component: "communication.websocket" });
   }
 
@@ -74,6 +77,16 @@ export class WebSocketCommunicationAdapter implements CommunicationAdapter {
 
           if (previousSocket && previousSocket !== socket) {
             previousSocket.close(1000, "Replaced by newer connection");
+          }
+
+          this.logger.info("websocket.client.connected");
+
+          if (this.helloPayload) {
+            try {
+              socket.send(JSON.stringify({ type: "hello", ...this.helloPayload }));
+            } catch {
+              // Hello is best-effort; never prevent connection from proceeding.
+            }
           }
 
           void this.flushQueuedEvents();

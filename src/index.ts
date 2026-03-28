@@ -58,6 +58,13 @@ async function main(): Promise<void> {
     adapter = new WebSocketCommunicationAdapter({
       port: config.communication.port,
       logger: baseLogger,
+      helloPayload: {
+        version: "0.1.0",
+        model: config.llm.model,
+        provider: config.llm.provider,
+        agentHome: config.agentHome,
+        workspace: process.cwd(),
+      },
     });
     await adapter.start();
 
