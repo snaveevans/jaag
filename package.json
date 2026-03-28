@@ -1,6 +1,7 @@
 {
   "name": "agent-daemon",
   "private": true,
+  "workspaces": ["packages/*"],
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
