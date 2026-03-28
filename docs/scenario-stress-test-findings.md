@@ -1,6 +1,8 @@
 # Scenario Stress Test Findings
 
-> **Purpose:** Accumulate findings from stress-testing scenarios 1, 3, 5, and 6 against the Primitive Agent Architecture and Tool Spec Format. These findings will be folded back into the main architecture and spec docs once all scenarios are complete.
+> **Purpose:** Accumulate findings from stress-testing scenarios 1, 3, 5, and 6 against the Primitive Agent Architecture and Tool Spec Format.
+>
+> For the canonical list of all six original scenarios, see [scenarios.md](./scenarios.md). This document is intentionally narrower: it records only the scenarios that were stress-tested in depth here. Scenario 4 has its deeper execution trace in `docs/architecture.md`, and Scenario 2 does not yet have a dedicated deep-dive writeup.
 
 ---
 
