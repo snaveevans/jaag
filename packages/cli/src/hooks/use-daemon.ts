@@ -290,6 +290,185 @@ function formatCommandResponse(command: string, data: unknown, error?: string): 
         formatField("Version:", formatValue(record.version))
       ].join("\n");
     }
+    case "schedules": {
+      if (!record) {
+        break;
+      }
+
+      const schedules = getArray(record.schedules);
+      const total = getNumber(record.total) ?? schedules?.length ?? 0;
+
+      if (!schedules || schedules.length === 0) {
+        return "Scheduled Tasks\n  No schedules found.";
+      }
+
+      const lines = [`Scheduled Tasks (${total})`];
+      for (const schedule of schedules) {
+        if (!isRecord(schedule)) {
+          continue;
+        }
+
+        const id = getString(schedule.id) ?? getString(schedule.schedule_id) ?? "?";
+        const shortId = id.length > 8 ? id.slice(0, 8) : id;
+        const workflow = getString(schedule.workflow) ?? "unknown";
+        const status = getString(schedule.status) ?? "unknown";
+        const triggerType = getString(schedule.triggerType) ?? getString(schedule.trigger_type) ?? "?";
+        const instruction = getString(schedule.instruction) ?? "";
+        const truncatedInstruction = instruction.length > 60 ? instruction.slice(0, 57) + "..." : instruction;
+        const nextFire = getString(schedule.nextFireAt) ?? getString(schedule.next_fire_at);
+        const fireCount = getNumber(schedule.fireCount) ?? getNumber(schedule.fire_count) ?? 0;
+
+        lines.push("");
+        lines.push(`  [${shortId}] ${workflow} (${status})`);
+        lines.push(`    Type: ${triggerType} | Fires: ${fireCount}${nextFire ? ` | Next: ${nextFire}` : ""}`);
+        if (truncatedInstruction) {
+          lines.push(`    "${truncatedInstruction}"`);
+        }
+      }
+
+      return lines.join("\n");
+    }
+    case "memory": {
+      if (!record) {
+        break;
+      }
+
+      const memories = getArray(record.memories);
+      const total = getNumber(record.total) ?? memories?.length ?? 0;
+
+      if (!memories || memories.length === 0) {
+        return "Stored Memories\n  No memories found.";
+      }
+
+      const lines = [`Stored Memories (${total})`];
+      for (const mem of memories) {
+        if (!isRecord(mem)) {
+          continue;
+        }
+
+        const domain = getString(mem.domain) ?? "(default)";
+        const key = getString(mem.key);
+        const value = getString(mem.value) ?? "";
+        const truncatedValue = value.length > 80 ? value.slice(0, 77) + "..." : value;
+        const accessCount = getNumber(mem.accessCount) ?? getNumber(mem.access_count) ?? 0;
+        const updatedAt = getString(mem.updatedAt) ?? getString(mem.updated_at) ?? "";
+
+        lines.push("");
+        if (key) {
+          lines.push(`  [${domain}] ${key}`);
+        } else {
+          lines.push(`  [${domain}]`);
+        }
+        lines.push(`    ${truncatedValue}`);
+        lines.push(`    Accessed: ${accessCount}x${updatedAt ? ` | Updated: ${updatedAt}` : ""}`);
+      }
+
+      return lines.join("\n");
+    }
+    case "history": {
+      if (!record) {
+        break;
+      }
+
+      const sessions = getArray(record.sessions);
+      const total = getNumber(record.total) ?? sessions?.length ?? 0;
+      const note = getString(record.note);
+
+      if (!sessions || sessions.length === 0) {
+        return `Active Sessions\n  No active sessions.${note ? `\n\n  Note: ${note}` : ""}`;
+      }
+
+      const lines = [`Active Sessions (${total})`];
+      for (const session of sessions) {
+        if (!isRecord(session)) {
+          continue;
+        }
+
+        const id = getString(session.id) ?? "?";
+        const shortId = id.length > 8 ? id.slice(0, 8) : id;
+        const triggerSource = getString(session.triggerSource) ?? getString(session.trigger_source) ?? "?";
+        const status = getString(session.status) ?? "unknown";
+        const messageCount = getNumber(session.messageCount) ?? getNumber(session.message_count) ?? 0;
+        const tokenEstimate = getNumber(session.tokenEstimate) ?? getNumber(session.token_estimate);
+        const createdAt = getString(session.createdAt) ?? getString(session.created_at) ?? "";
+
+        lines.push("");
+        lines.push(`  [${shortId}] ${triggerSource} session (${status})`);
+        lines.push(`    Messages: ${messageCount}${tokenEstimate !== null ? ` | Tokens: ~${tokenEstimate}` : ""}`);
+        if (createdAt) {
+          lines.push(`    Created: ${createdAt}`);
+        }
+      }
+
+      if (note) {
+        lines.push("");
+        lines.push(`  Note: ${note}`);
+      }
+
+      return lines.join("\n");
+    }
+    case "compact": {
+      if (!record) {
+        break;
+      }
+
+      const config = isRecord(record.config) ? record.config : null;
+      const summaries = getArray(record.storedSummaries);
+      const summaryCount = getNumber(record.summaryCount) ?? summaries?.length ?? 0;
+      const note = getString(record.note);
+
+      const lines = ["Compaction Info"];
+
+      if (config) {
+        const trigger = getNumber(config.triggerUtilization) ?? getNumber(config.trigger_utilization);
+        const ceiling = getNumber(config.hardCeilingUtilization) ?? getNumber(config.hard_ceiling_utilization);
+        const keepWindow = getNumber(config.keepWindow) ?? getNumber(config.keep_window);
+        const contextLimit = getNumber(config.contextLimit) ?? getNumber(config.context_limit);
+
+        lines.push("");
+        lines.push("  Configuration:");
+        if (trigger !== null) {
+          lines.push(`    Trigger at: ${Math.round(trigger * 100)}% utilization`);
+        }
+        if (ceiling !== null) {
+          lines.push(`    Hard ceiling: ${Math.round(ceiling * 100)}% utilization`);
+        }
+        if (keepWindow !== null) {
+          lines.push(`    Keep window: ${keepWindow} recent messages`);
+        }
+        if (contextLimit !== null) {
+          lines.push(`    Context limit: ${contextLimit} tokens`);
+        }
+      }
+
+      lines.push("");
+      lines.push(`  Stored Summaries: ${summaryCount}`);
+
+      if (summaries && summaries.length > 0) {
+        for (const summary of summaries) {
+          if (!isRecord(summary)) {
+            continue;
+          }
+
+          const key = getString(summary.key) ?? "?";
+          const updatedAt = getString(summary.updatedAt) ?? getString(summary.updated_at) ?? "";
+          const preview = getString(summary.valuePreview) ?? getString(summary.value_preview) ?? "";
+          const truncatedPreview = preview.length > 80 ? preview.slice(0, 77) + "..." : preview;
+
+          lines.push(`    • ${key}${updatedAt ? ` (${updatedAt})` : ""}`);
+          if (truncatedPreview) {
+            lines.push(`      ${truncatedPreview}`);
+          }
+        }
+      }
+
+      if (note) {
+        lines.push("");
+        lines.push(`  Note: ${note}`);
+      }
+
+      return lines.join("\n");
+    }
   }
 
   const fallback = JSON.stringify(data, null, 2);
