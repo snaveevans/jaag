@@ -33,6 +33,7 @@ export function App(): React.JSX.Element {
     isStreaming,
     pendingPrompt,
     sendMessage,
+    sendCommand,
     clearMessages
   } = useDaemon(config.daemonUrl);
 
@@ -66,7 +67,7 @@ export function App(): React.JSX.Element {
   );
 
   const handleSlashCommand = useCallback(
-    (command: string) => {
+    (command: string, args: string) => {
       switch (command) {
         case "quit":
         case "exit": {
@@ -88,13 +89,32 @@ export function App(): React.JSX.Element {
           appendSystemMessage(
             [
               "Available commands:",
-              "/help  Show available commands",
-              "/clear Clear the current conversation",
-              "/new   Start a fresh conversation",
-              "/quit  Exit Jack",
-              "/exit  Exit Jack"
+              "/help    Show available commands",
+              "/model   Show current model configuration",
+              "/tools   List available tools",
+              "/policy  Show active policy rules",
+              "/status  Show daemon status",
+              "/clear   Clear the current conversation",
+              "/new     Start a fresh conversation",
+              "/quit    Exit Jack",
+              "/exit    Exit Jack"
             ].join("\n")
           );
+          setScreen("chat");
+          return;
+        }
+        case "model":
+        case "tools":
+        case "policy":
+        case "status": {
+          if (connectionState !== "connected") {
+            appendSystemMessage("Not connected to daemon. Cannot run /" + command);
+            setScreen("chat");
+            return;
+          }
+
+          const parsedArgs = args.trim() ? args.trim().split(/\s+/) : undefined;
+          sendCommand(command, parsedArgs);
           setScreen("chat");
           return;
         }
@@ -104,7 +124,7 @@ export function App(): React.JSX.Element {
         }
       }
     },
-    [appendSystemMessage, clearMessages, exit]
+    [appendSystemMessage, clearMessages, connectionState, exit, sendCommand]
   );
 
   const placeholder = pendingPrompt

@@ -1,4 +1,4 @@
-export type ServerMessage = HelloMessage | ContentMessage | StreamChunkMessage;
+export type ServerMessage = HelloMessage | ContentMessage | StreamChunkMessage | CommandResponseMessage;
 
 export interface HelloMessage {
   type: "hello";
@@ -25,10 +25,25 @@ export interface StreamChunkMessage {
   content: string;
 }
 
+export interface CommandResponseMessage {
+  type: "command_response";
+  command: string;
+  data: unknown;
+  error?: string;
+}
+
 export interface ClientMessage {
   type: "message";
   content: string;
   replyToPromptId?: string;
+}
+
+export type ClientOutbound = ClientMessage | ClientCommandMessage;
+
+export interface ClientCommandMessage {
+  type: "command";
+  command: string;
+  args?: string[];
 }
 
 export interface DisplayMessage {
