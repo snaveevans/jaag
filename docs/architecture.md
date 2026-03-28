@@ -2,6 +2,12 @@
 
 > **Thesis:** Most "agent frameworks" operate at the wrong abstraction layer. Instead of coding orchestration logic, define a minimal set of universal primitives and let the model handle routing. Tools become declarative JSON specs — not code.
 
+Related ADRs:
+- `docs/decisions/ADR-0001-use-seven-runtime-primitives-for-agent-capabilities.md`
+- `docs/decisions/ADR-0003-enforce-safety-outside-agent-controlled-specs.md`
+- `docs/decisions/ADR-0004-use-sqlite-fts5-memory-with-keyed-and-fuzzy-access.md`
+- `docs/decisions/ADR-0005-run-scheduled-work-as-full-agent-sessions.md`
+
 ---
 
 ## The Core Idea

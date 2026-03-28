@@ -2,7 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CommunicationAdapter, DeliveryResult, InboundMessage, OutboundMessage } from "../communication/adapter.ts";
+import type {
+  CommandResponse,
+  CommunicationAdapter,
+  DeliveryResult,
+  InboundCommand,
+  InboundMessage,
+  OutboundMessage,
+} from "../communication/adapter.ts";
 import {
   buildCompactedMessageHistory,
   buildCompactionRequestMessages,
@@ -53,6 +60,8 @@ class FakeAdapter implements CommunicationAdapter {
   onMessage(handler: (message: InboundMessage) => void): void {
     this.handler = handler;
   }
+
+  onCommand(_handler: (command: InboundCommand) => Promise<CommandResponse>): void {}
 
   isConnected(): boolean {
     return true;

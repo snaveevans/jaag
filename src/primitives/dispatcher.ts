@@ -140,6 +140,10 @@ export class PrimitiveDispatcher {
     return this.policy.summary;
   }
 
+  getPolicy(): LoadedPolicy {
+    return this.policy;
+  }
+
   setAuthorizationCodeHandler(handler: AuthDependencies["askForAuthorizationCode"] | undefined): void {
     this.interpreter.setAuthorizationCodeHandler(handler);
   }

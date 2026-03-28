@@ -23,6 +23,7 @@ export function App(): React.JSX.Element {
   const { exit } = useApp();
   const [screen, setScreen] = useState<ScreenState>("welcome");
   const [localMessages, setLocalMessages] = useState<DisplayMessage[]>([]);
+  const [showThinking, setShowThinking] = useState(false);
 
   const config = useMemo(() => loadCliConfig(), []);
   const {
@@ -33,6 +34,7 @@ export function App(): React.JSX.Element {
     isStreaming,
     pendingPrompt,
     sendMessage,
+    sendCommand,
     clearMessages
   } = useDaemon(config.daemonUrl);
 
@@ -66,7 +68,7 @@ export function App(): React.JSX.Element {
   );
 
   const handleSlashCommand = useCallback(
-    (command: string) => {
+    (command: string, args: string) => {
       switch (command) {
         case "quit":
         case "exit": {
@@ -88,13 +90,50 @@ export function App(): React.JSX.Element {
           appendSystemMessage(
             [
               "Available commands:",
-              "/help  Show available commands",
-              "/clear Clear the current conversation",
-              "/new   Start a fresh conversation",
-              "/quit  Exit Jack",
-              "/exit  Exit Jack"
+              "/help       Show available commands",
+              "/model      Show current model configuration",
+              "/tools      List available tools",
+              "/policy     Show active policy rules",
+              "/status     Show daemon status",
+              "/schedules  List scheduled tasks",
+              "/memory     Show recent memories",
+              "/history    Show active sessions",
+              "/thinking   Toggle thinking display",
+              "/compact    Show compaction info",
+              "/clear      Clear the current conversation",
+              "/new        Start a fresh conversation",
+              "/quit       Exit Jack",
+              "/exit       Exit Jack"
             ].join("\n")
           );
+          setScreen("chat");
+          return;
+        }
+        case "thinking": {
+          setShowThinking((prev) => {
+            const next = !prev;
+            appendSystemMessage(`Thinking display: ${next ? "on" : "off"}`);
+            return next;
+          });
+          setScreen("chat");
+          return;
+        }
+        case "model":
+        case "tools":
+        case "policy":
+        case "status":
+        case "schedules":
+        case "memory":
+        case "history":
+        case "compact": {
+          if (connectionState !== "connected") {
+            appendSystemMessage("Not connected to daemon. Cannot run /" + command);
+            setScreen("chat");
+            return;
+          }
+
+          const parsedArgs = args.trim() ? args.trim().split(/\s+/) : undefined;
+          sendCommand(command, parsedArgs);
           setScreen("chat");
           return;
         }
@@ -104,7 +143,7 @@ export function App(): React.JSX.Element {
         }
       }
     },
-    [appendSystemMessage, clearMessages, exit]
+    [appendSystemMessage, clearMessages, connectionState, exit, sendCommand]
   );
 
   const placeholder = pendingPrompt

@@ -18,6 +18,16 @@ export interface InboundMessage {
   replyToPromptId?: string;
 }
 
+export interface InboundCommand {
+  command: string;
+  args?: string[];
+}
+
+export interface CommandResponse {
+  data: unknown;
+  error?: string;
+}
+
 export type DeliveryResult =
   | {
       delivered: true;
@@ -32,5 +42,6 @@ export type DeliveryResult =
 export interface CommunicationAdapter {
   send(message: OutboundMessage): Promise<DeliveryResult>;
   onMessage(handler: (message: InboundMessage) => void): void;
+  onCommand(handler: (command: InboundCommand) => Promise<CommandResponse>): void;
   isConnected(): boolean;
 }
